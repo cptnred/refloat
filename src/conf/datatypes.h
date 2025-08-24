@@ -286,6 +286,12 @@ typedef struct {
     float atr_filter;
     float atr_amps_accel_ratio;
     float atr_amps_decel_ratio;
+    float incline_threshold_default;
+    float hold_tilt_min_target;
+    float hold_tilt_time_window;
+    float hold_tilt_pitch_delta_threshold;
+    int hold_tilt_timeout;
+    float hold_tilt_angle;
     float braketilt_strength;
     float braketilt_lingering;
     float turntilt_strength;

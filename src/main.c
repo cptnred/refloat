@@ -899,12 +899,17 @@ static void refloat_thd(void *arg) {
 
                     torque_tilt_update(&d->torque_tilt, &d->motor, &d->float_conf);
                     atr_update(&d->atr, &d->motor, &d->float_conf);
+                    float balance_offset = d->setpoint - d->imu.balance_pitch;
+                    float dt = d->loop_time_us / 1e6f;
                     brake_tilt_update(
                         &d->brake_tilt,
                         &d->motor,
                         &d->atr,
                         &d->float_conf,
-                        d->setpoint - d->imu.balance_pitch
+                        balance_offset,
+                        &d->imu,
+                        dt,
+                        d->state.wheelslip
                     );
                 }
 
@@ -1622,7 +1627,11 @@ static void cmd_tune_defaults(Data *d) {
     d->float_conf.atr_amps_decel_ratio = CFG_DFLT_ATR_AMPS_DECEL_RATIO;
     d->float_conf.braketilt_strength = CFG_DFLT_BRAKETILT_STRENGTH;
     d->float_conf.braketilt_lingering = CFG_DFLT_BRAKETILT_LINGERING;
-
+    d->float_conf.hold_tilt_min_target = CFG_DFLT_HOLD_TILT_MIN_TARGET;
+    d->float_conf.hold_tilt_time_window = CFG_DFLT_HOLD_TILT_TIME_WINDOW;
+    d->float_conf.hold_tilt_pitch_delta_threshold = CFG_DFLT_HOLD_TILT_PITCH_DELTA_THRESHOLD;
+    d->float_conf.hold_tilt_timeout = CFG_DFLT_HOLD_TILT_TIMEOUT;
+    d->float_conf.hold_tilt_angle = CFG_DFLT_HOLD_TILT_ANGLE;
     d->float_conf.startup_pitch_tolerance = CFG_DFLT_STARTUP_PITCH_TOLERANCE;
     d->float_conf.startup_roll_tolerance = CFG_DFLT_STARTUP_ROLL_TOLERANCE;
     d->float_conf.startup_speed = CFG_DFLT_STARTUP_SPEED;
