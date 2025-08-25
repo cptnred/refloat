@@ -59,14 +59,10 @@ void brake_tilt_update(
 ) {
     // braking also should cause setpoint change lift, causing a delayed lingering nose lift
     // --- Threshold selection for incline/decline detection ---
-    float incline_threshold = config->atr_threshold_up != 0.0f ? config->atr_threshold_up
-                                                               : config->incline_threshold_default;
-    float decline_threshold = config->atr_threshold_down != 0.0f
-        ? config->atr_threshold_down
-        : config->incline_threshold_default;
+    float incline_threshold = config->incline_threshold_default;
 
     // --- Only on level ground and no wheelslip ---
-    if (wheelslip || atr->accel_diff > incline_threshold || atr->accel_diff < -decline_threshold) {
+    if (wheelslip || atr->accel_diff > incline_threshold || atr->accel_diff < -incline_threshold) {
         // Deactivate Brake-Tilt and Hold-Tilt if wheelslip, incline or decline detected
         bt->target = 0;
         if (bt->hold_tilt_active) {
@@ -130,6 +126,11 @@ void brake_tilt_update(
     // --- Hold-Tilt Behavior ---
     if (bt->hold_tilt_active) {
         bt->setpoint = bt->hold_tilt_value;
+        // Enhancement: check if the balance pitch is below the target hold tilt value
+        if (imu->balance_pitch < bt->hold_tilt_value) {
+            float diff = bt->hold_tilt_value - imu->balance_pitch;
+            bt->setpoint += 0.5f * diff;
+        }
         if (--bt->hold_counter <= 0) {
             bt->hold_tilt_active = false;
             bt->hold_counter = 0;
