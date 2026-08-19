@@ -513,10 +513,10 @@ Item {
         }
 
         function applyConfig(config) {
-            if (!checkConfig()) return;
+            if (!checkConfig()) return false;
 
             if (!versionCompatible(config)) {
-                return;
+                return false;
             }
 
             for (let [key, value] of Object.entries(config.settings)) {
@@ -536,6 +536,7 @@ Item {
             }
 
             writeConfig();
+            return true;
         }
 
         function diffConfig(other) {
@@ -558,6 +559,7 @@ Item {
                                 if (value !== otherValue) {
                                     differs.push({
                                         "name": paramName,
+                                        "group": subGroup,
                                         "value": value,
                                         "otherValue": otherValue
                                     });
@@ -921,7 +923,6 @@ Item {
         property alias showBattVoltagePerCell: prefShowBattVoltagePerCell.checked
         property alias battCurrentLog: prefBattCurrentLog.checked
         property int tempWarningOffset: 10
-        property alias tuneSlotCount: prefTuneSlotCount.value
         property alias showTuneDiffCount: prefShowTuneDiffCount.checked
         property int plotMaxWindowMinutes: 30
         property alias showWelcomeDialog: prefShowWelcomeDialog.checked
@@ -1370,20 +1371,24 @@ Item {
             property var tuneArchive
             property var tuneArchiveDownloadDate
 
+            property var hermesArchive
+            property var hermesArchiveDownloadDate
+            property var hermesTuneCache
+
+            property var myTunes
+            property var currentTune
+            property var tuneSlotsMigrated
+
             property var fullBackup
         }
 
-        property var tunes: {
-            var tunes = {}
-            for (var slot = 1; slot <= maxTunes; slot++) {
-                var tune = loadTune(slot);
-                if (tune) {
-                    tunes[slot] = tune;
-                }
-            }
-
-            return tunes;
-        }
+        // Filled once in Component.onCompleted instead of by a binding:
+        // loadMyTunes() reads tuneStorage.myTunes and writes it again during the
+        // same evaluation (slot migration), which Qt reports as a binding loop
+        // and then stops re-evaluating - silently, and on every start.
+        property var myTunes: []
+        readonly property var favoriteTunes: (myTunes || []).filter((tune) => tune && tune.favorite)
+        property var currentTune: loadCurrentTune()
 
         function replaceProperty(tune, oldName, newName) {
             if (tune.settings.hasOwnProperty(oldName)) {
@@ -1418,7 +1423,8 @@ Item {
         function onUpdate() {
             triggerAutoRestore();
             // force recalculation of dependent variables
-            tunes = tunes;
+            myTunes = myTunes;
+            currentTune = currentTune;
         }
 
         property alias fullBackup: tuneStorage.fullBackup
@@ -1615,15 +1621,6 @@ Item {
             }
         }
 
-        function saveTune(slot, tune) {
-            var id = tuneId(slot);
-            tuneStorage.setValue(id, JSON.stringify(convertToOldFormat(tune)));
-
-            tunes[slot] = tune;
-            // workaround needed so that the change is written through to the storage
-            tunes = tunes;
-        }
-
         function loadTune(slot) {
             var tune = tuneStorage.value(tuneId(slot));
             if (tune) {
@@ -1635,15 +1632,136 @@ Item {
             return null;
         }
 
-        function eraseTune(slot) {
-            tuneStorage.setValue(tuneId(slot), "");
-            tunes[slot] = null;
-            // workaround needed so that the change is written through to the storage
-            tunes = tunes;
+        function generateUuid() {
+            return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
         }
 
-        function slotEmpty(slot) {
-            return !tuneStorage.value(tuneId(slot), null);
+        function slotsMigrated() {
+            var value = tuneStorage.tuneSlotsMigrated;
+            return value === true || value === "true";
+        }
+
+        // One-time migration of the legacy tune_slot_N storage into myTunes.
+        // The slot keys are kept so downgrading the package remains possible.
+        function migrateTuneSlots() {
+            var migrated = [];
+            for (var slot = 1; slot <= maxTunes; slot++) {
+                var tune = loadTune(slot);
+                if (tune) {
+                    tune.uuid = generateUuid();
+                    tune.favorite = true;
+                    tune.source = {"type": "local"};
+                    migrated.push(tune);
+                }
+            }
+            tuneStorage.myTunes = JSON.stringify(migrated);
+            tuneStorage.tuneSlotsMigrated = true;
+        }
+
+        function loadMyTunes() {
+            if (!slotsMigrated()) {
+                migrateTuneSlots();
+            }
+
+            var tunes = tuneStorage.myTunes;
+            if (!tunes) {
+                return [];
+            }
+            if (typeof tunes === "string") {
+                tunes = JSON.parse(tunes);
+            }
+            return tunes.map((tune) => tune.package ? migrateTune(tune) : tune);
+        }
+
+        function saveMyTunes(tunes) {
+            tuneStorage.myTunes = JSON.stringify(tunes);
+            // workaround needed so that the change is written through to the storage
+            myTunes = tunes;
+        }
+
+        function addMyTune(tune) {
+            if (!tune.uuid) {
+                tune.uuid = generateUuid();
+            }
+            var tunes = myTunes;
+            tunes.push(tune);
+            saveMyTunes(tunes);
+            return tune.uuid;
+        }
+
+        function findMyTuneIndex(uuid) {
+            for (var i = 0; i < myTunes.length; i++) {
+                if (myTunes[i].uuid === uuid) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        function findMyTune(uuid) {
+            var index = findMyTuneIndex(uuid);
+            return index >= 0 ? myTunes[index] : null;
+        }
+
+        function findMyTuneBySource(source) {
+            for (var i = 0; i < myTunes.length; i++) {
+                var tuneSource = myTunes[i].source;
+                if (!tuneSource || tuneSource.type !== source.type) {
+                    continue;
+                }
+                var matches = source.type === "hermes"
+                    ? tuneSource.id === source.id
+                    : myTunes[i].name === source.name;
+                if (matches) {
+                    return myTunes[i];
+                }
+            }
+            return null;
+        }
+
+        function saveMyTune(uuid, tune) {
+            var index = findMyTuneIndex(uuid);
+            if (index < 0) {
+                return;
+            }
+            var tunes = myTunes;
+            tunes[index] = tune;
+            saveMyTunes(tunes);
+        }
+
+        function deleteMyTune(uuid) {
+            var index = findMyTuneIndex(uuid);
+            if (index < 0) {
+                return;
+            }
+            var tunes = myTunes;
+            tunes.splice(index, 1);
+            saveMyTunes(tunes);
+        }
+
+        function setFavorite(uuid, favorite) {
+            var tune = findMyTune(uuid);
+            if (!tune) {
+                return;
+            }
+            tune.favorite = favorite;
+            saveMyTunes(myTunes);
+        }
+
+        function setCurrentTune(tune) {
+            tuneStorage.currentTune = JSON.stringify(tune);
+            currentTune = tune;
+        }
+
+        function loadCurrentTune() {
+            var tune = tuneStorage.currentTune;
+            if (!tune) {
+                return null;
+            }
+            if (typeof tune === "string") {
+                tune = JSON.parse(tune);
+            }
+            return tune;
         }
 
         function saveTuneArchive(tuneArchive) {
@@ -1714,7 +1832,176 @@ Item {
             return result;
         }
 
+        function saveHermesArchive(archive) {
+            tuneStorage.hermesArchive = JSON.stringify(archive);
+            tuneStorage.hermesArchiveDownloadDate = new Date();
+        }
+
+        function loadHermesArchive() {
+            if (tuneStorage.hermesArchive) {
+                if (typeof tuneStorage.hermesArchive === "string") {
+                    return JSON.parse(tuneStorage.hermesArchive);
+                } else {
+                    return tuneStorage.hermesArchive;
+                }
+            }
+            return null;
+        }
+
+        function getHermesArchiveDate() {
+            return Qt.formatDateTime(tuneStorage.hermesArchiveDownloadDate);
+        }
+
+        function loadHermesTuneCache() {
+            if (tuneStorage.hermesTuneCache) {
+                if (typeof tuneStorage.hermesTuneCache === "string") {
+                    return JSON.parse(tuneStorage.hermesTuneCache);
+                } else {
+                    return tuneStorage.hermesTuneCache;
+                }
+            }
+            return {};
+        }
+
+        function cacheHermesTune(id, tune) {
+            var cache = loadHermesTuneCache();
+            cache[id] = tune;
+            tuneStorage.hermesTuneCache = JSON.stringify(cache);
+        }
+
+        function loadCachedHermesTune(id) {
+            return loadHermesTuneCache()[id] || null;
+        }
+
+        function decodeHtmlEntities(text) {
+            return text
+                .replace(/&lt;/g, "<")
+                .replace(/&gt;/g, ">")
+                .replace(/&quot;/g, "\"")
+                .replace(/&#39;/g, "'")
+                .replace(/&amp;/g, "&");
+        }
+
+        // Scrapes the tune cards from the ridehermes.app/tunes HTML listing.
+        // Each card's markup precedes its "View" link (href="/tunes/<id>"),
+        // starting at the last card-header-2 occurrence before it.
+        function parseHermesListing(html) {
+            try {
+                var result = [];
+                var chunks = html.split(/href="\/tunes\/(\d+)"/);
+                for (var i = 1; i < chunks.length; i += 2) {
+                    var id = parseInt(chunks[i]);
+                    var card = chunks[i - 1];
+                    var headerPos = card.lastIndexOf("card-header-2");
+                    if (headerPos < 0) {
+                        continue;
+                    }
+                    card = card.substring(headerPos);
+
+                    var nameMatch = card.match(/>([^<]+)</);
+                    if (!nameMatch) {
+                        continue;
+                    }
+                    var likesMatch = card.match(/\/likes"[\s\S]*?<\/i>\s*(\d+)/);
+                    // decorated usernames wrap the name in a nested span carrying data-name
+                    var authorMatch = card.match(/pantheon-name[^>]*data-name="([^"]*)"/)
+                        || card.match(/pantheon-username[^>]*>([^<]+)</);
+                    var downloadsMatch = card.match(/(\d+)\s+downloads?/);
+                    var descriptionMatch = card.match(/<div class="card-text mb-2">([\s\S]*?)<\/div>/);
+
+                    var categories = [];
+                    var badgeRe = /badge rounded-pill[^>]*>([^<]*)</g;
+                    var badgeMatch;
+                    while ((badgeMatch = badgeRe.exec(card)) !== null) {
+                        categories.push(badgeMatch[1].trim());
+                    }
+
+                    result.push({
+                        "id": id,
+                        "name": decodeHtmlEntities(nameMatch[1].trim()),
+                        "author": authorMatch ? decodeHtmlEntities(authorMatch[1].trim()) : "",
+                        "likes": likesMatch ? parseInt(likesMatch[1]) : 0,
+                        "downloads": downloadsMatch ? parseInt(downloadsMatch[1]) : 0,
+                        "categories": categories,
+                        "description": descriptionMatch
+                            ? decodeHtmlEntities(descriptionMatch[1].replace(/<[^>]*>/g, "")).trim()
+                            : ""
+                    });
+                }
+                return result.length > 0 ? result : null;
+            } catch (error) {
+                print("Refloat: Failed to parse Hermes tune listing: " + error);
+                return null;
+            }
+        }
+
+        // Parses the flat <CustomConfiguration> XML from
+        // ridehermes.app/tunes/<id>/download. Params unknown to Refloat are
+        // kept, applyConfig and diffConfig skip them.
+        function parseHermesTuneXml(xml, listingEntry) {
+            if (!xml || xml.indexOf("<CustomConfiguration") < 0) {
+                return null;
+            }
+
+            var settings = {};
+            // self-closing elements (<param nil="true"/>) don't match and are skipped
+            var paramRe = /<([a-zA-Z0-9_.-]+)([^>\/]*)>([^<]*)<\/\1>/g;
+            var match;
+            while ((match = paramRe.exec(xml)) !== null) {
+                var name = match[1].replace(/-/g, "_");
+                if (name === "id") {
+                    continue;
+                }
+
+                var typeMatch = match[2].match(/type="([a-z]+)"/);
+                var text = match[3];
+                var value;
+                // every parameter carries a type, metadata elements (name,
+                // creator, description, color) don't and are skipped
+                switch (typeMatch ? typeMatch[1] : "") {
+                case "float":
+                    value = parseFloat(text);
+                    break;
+                case "integer":
+                    value = parseInt(text);
+                    break;
+                case "boolean":
+                    value = text === "true";
+                    break;
+                default:
+                    continue;
+                }
+
+                if (typeof value === "number" && Number.isNaN(value)) {
+                    continue;
+                }
+
+                settings[name] = value;
+            }
+
+            if (Object.keys(settings).length === 0) {
+                return null;
+            }
+
+            var tune = {
+                // set the version to the current one to always pass the version check
+                "version": formatVersion,
+                "name": listingEntry.name,
+                "date": new Date(),
+                "package": {
+                    "name": packageName,
+                    "version": packageVersion
+                },
+                "settings": settings
+            };
+            if (listingEntry.description) {
+                tune.description = listingEntry.description;
+            }
+            return tune;
+        }
+
         Component.onCompleted: {
+            myTunes = loadMyTunes();
             var idBackup = loadBackup("backup_" + board.getId());
             if (idBackup) {
                 idBackupFinished(idBackup);
@@ -5161,30 +5448,6 @@ Item {
                             text: "Motor/Controller temperatures will be highlighted red if above TEMP - OFFSET, where TEMP is your Motor/MOSFET Temp Cutoff Start in Motor config. The package beeps when temperatures cross the TEMP - 3°C threshold and pushback triggers at TEMP - 2°C."
                         }
 
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Layout.rightMargin: 20
-
-                            LText {
-                                text: "Number of tune slots"
-                            }
-
-                            Slider {
-                                id: prefTuneSlotCount
-                                Layout.fillWidth: true
-
-                                from: 2
-                                to: tuneManager.maxTunes
-                                value: 6
-                                stepSize: 1
-                            }
-
-                            LText {
-                                text: prefTuneSlotCount.value
-                                font.pointSize: 16
-                            }
-                        }
-
                         RightSwitch {
                             id: prefShowTuneDiffCount
                             checked: false
@@ -5286,12 +5549,15 @@ Item {
         title: tune ? "Edit Tune" : "Save Tune"
         standardButtons: !!tune ? Dialog.Save | Dialog.Discard | Dialog.Close : Dialog.Save | Dialog.Close
 
-        property var tuneSlot
+        property string tuneUuid
         property var tune: null
 
-        function show(slot) {
-            tuneSlot = slot;
-            tune = tuneManager.loadTune(slot);
+        function show(uuid) {
+            tuneUuid = uuid || "";
+            // deep copy, so canceling the dialog doesn't mutate the stored tune
+            var stored = tuneUuid ? tuneManager.findMyTune(tuneUuid) : null;
+            tune = stored ? JSON.parse(JSON.stringify(stored)) : null;
+            saveTuneFavorite.checked = tune ? !!tune.favorite : true;
             editTuneDiff.setModel(packageConfig.diffConfig(tune).differs);
             editTuneDiff.reset();
 
@@ -5311,19 +5577,25 @@ Item {
             if (saveTuneNameInput.text) {
                 if (!tune) {
                     tune = tuneManager.createTune(saveTuneNameInput.text, saveTuneDescInput.text, packageConfig.fetchConfig(true));
+                    tune.source = {"type": "local"};
                 } else {
                     var success = tuneManager.updateTune(tune, saveTuneNameInput.text, saveTuneDescInput.text, saveTuneOverwrite.checked ? packageConfig.fetchConfig(true) : null);
                     if (!success) {
                         return;
                     }
                 }
-                tuneManager.saveTune(tuneSlot, tune);
+                tune.favorite = saveTuneFavorite.checked;
+                if (tuneUuid) {
+                    tuneManager.saveMyTune(tuneUuid, tune);
+                } else {
+                    tuneManager.addMyTune(tune);
+                }
                 VescIf.emitStatusMessage(saveTuneNameInput.text + " saved", true);
             }
         }
 
         onDiscarded: {
-            tuneManager.eraseTune(tuneSlot);
+            tuneManager.deleteMyTune(tuneUuid);
             VescIf.emitStatusMessage(tune.name + " erased", true);
             close();
         }
@@ -5386,104 +5658,530 @@ Item {
                 visible: editTuneDialog.tune && !editTuneDiff.isEmpty
                 text: "Overwrite with current tune"
             }
+
+            CheckBox {
+                id: saveTuneFavorite
+
+                checked: true
+                text: "Show on Tunes tab (favorite)"
+            }
         }
     }
 
     BaseDialog {
-        id: tuneArchiveDialog
+        id: tuneLibraryDialog
         implicitHeight: fullHeight
         clip: true
 
-        title: "Tune Archive"
-        standardButtons: Dialog.Reset | Dialog.Close
+        title: "Tune Library"
+        standardButtons: Dialog.Close
 
-        function download() {
-            tuneArchiveDownloadStatus.text = "Downloading tunes...";
-            var http = new XMLHttpRequest();
-            var url = "http://us-central1-mimetic-union-377520.cloudfunctions.net/float_package_tunes_via_http";
-            http.open("GET", url, true);
-            http.onreadystatechange = function() {
-                if (http.readyState === XMLHttpRequest.DONE) {
-                    if (http.status === 200) {
-                        tuneArchiveDownloadStatus.text = "Download succesful.";
+        function show(tab) {
+            tuneLibraryTabBar.currentIndex = tab || 0;
+            open();
+            // the page is already visible on the first open, so its
+            // onVisibleChanged doesn't fire and it has to be loaded here
+            var page = tuneLibraryStackLayout.children[tuneLibraryStackLayout.currentIndex];
+            if (page.ensureLoaded) {
+                page.ensureLoaded();
+            }
+        }
 
-                        var tunes = tuneManager.parseCsv(http.responseText);
-                        tuneManager.saveTuneArchive(tunes);
-                        downloadedTunesModel.setTunes(tunes);
-                    } else if (http.status === 0) {
-                        tuneArchiveDownloadStatus.text = "Download failed: Connection error";
-                    } else {
-                        tuneArchiveDownloadStatus.text = "Download failed: %1 - %2".arg(http.status).arg(http.statusText);
+        component TuneListItem : Rectangle {
+            id: listItem
+
+            property string name
+            property string subtitle
+            property var categories: []
+            property string description
+            property bool favorite: false
+            property bool editable: false
+
+            signal clicked()
+            signal held()
+            signal favoriteToggled()
+
+            readonly property string starSvg: "M 25 6 L 29.7 19.5 L 44 19.8 L 32.6 28.5 L 36.8 42.2 L 25 34 L 13.2 42.2 L 17.4 28.5 L 6 19.8 L 20.3 19.5 Z"
+
+            implicitHeight: listItemLayout.implicitHeight + 0.4 * unit
+            radius: 3
+            border.width: 2
+            border.color: Utility.getAppHexColor("lightText")
+            color: listItemMouseArea.pressed
+                ? Utility.getAppHexColor("lightestBackground")
+                : Utility.getAppHexColor("normalBackground")
+
+            MouseArea {
+                id: listItemMouseArea
+                anchors.fill: parent
+                onClicked: listItem.clicked()
+                onPressAndHold: listItem.held()
+            }
+
+            RowLayout {
+                id: listItemLayout
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: 0.3 * unit
+                anchors.rightMargin: 0.15 * unit
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 2
+
+                    LText {
+                        Layout.fillWidth: true
+                        text: listItem.name
+                        elide: Text.ElideRight
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        visible: !!listItem.subtitle
+                        font.pixelSize: fontSizeSuperSmall
+                        text: listItem.subtitle
+                        elide: Text.ElideRight
+                    }
+
+                    Row {
+                        spacing: 4
+                        visible: listItem.categories.length > 0
+
+                        Repeater {
+                            model: listItem.categories
+
+                            Rectangle {
+                                radius: height / 2
+                                color: Utility.getAppHexColor("lightBackground")
+                                implicitHeight: badgeText.implicitHeight + 4
+                                implicitWidth: badgeText.implicitWidth + 12
+
+                                DText {
+                                    id: badgeText
+                                    anchors.centerIn: parent
+                                    font.pixelSize: fontSizeSuperSmall
+                                    text: modelData
+                                }
+                            }
+                        }
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        visible: !!listItem.description
+                        font.pixelSize: fontSizeSuperSmall
+                        wrapMode: Text.WordWrap
+                        elide: Text.ElideRight
+                        maximumLineCount: 2
+                        text: listItem.description
                     }
                 }
 
-            };
+                FloatingToolButton {
+                    visible: listItem.editable
+                    size: 0.9 * unit
+                    Layout.preferredWidth: size
+                    Layout.preferredHeight: size
+                    bgColor: Utility.getAppHexColor("normalBackground")
 
-            http.send();
-        }
+                    iconPath: Path {
+                        PathSvg {path: "M 12 38 L 14 30 L 34 10 L 40 16 L 20 36 L 12 38 M 14 30 L 20 36"}
+                    }
 
-        function show() {
-            open();
+                    onClicked: listItem.held()
+                }
 
-            var tuneArchive = tuneManager.loadTuneArchive();
-            // backwards compatibility: Check for the first item settings not being an array (if it is, redownload)
-            if (tuneArchive && tuneArchive.length > 0 && !Array.isArray(tuneArchive[0].settings)) {
-                downloadedTunesModel.setTunes(tuneArchive);
-                tuneArchiveDownloadStatus.text = "Tunes downloaded on %1".arg(tuneManager.getTuneArchiveDate());
-            } else {
-                download();
+                ToggleFloatingToolButton {
+                    autonomous: false
+                    value: listItem.favorite
+                    size: 0.9 * unit
+                    Layout.preferredWidth: size
+                    Layout.preferredHeight: size
+                    bgColor: Utility.getAppHexColor("normalBackground")
+                    fillColor: Utility.getAppHexColor("lightAccent")
+
+                    falseIconPath: Path { PathSvg {path: listItem.starSvg} }
+                    trueIconPath: Path { PathSvg {path: listItem.starSvg} }
+                    trueFillIconPath: Path { PathSvg {path: listItem.starSvg} }
+
+                    onClicked: listItem.favoriteToggled()
+                }
             }
-        }
-
-        onReset: {
-            download();
-        }
-
-        Component.onCompleted: {
-            standardButton(Dialog.Reset).text = "Refresh"
         }
 
         ColumnLayout {
-            anchors.centerIn: parent
-            width: parent.width * 0.95
+            width: tuneLibraryDialog.availableWidth
             height: parent.height
-            spacing: 15
-            clip: true
 
-            LText {
-                id: tuneArchiveDownloadStatus
+            TabBar {
+                id: tuneLibraryTabBar
                 Layout.fillWidth: true
-                Layout.alignment: Qt.AlignHCenter
-
-                font.pointSize: 11
-                horizontalAlignment: Text.AlignHCenter
-                wrapMode: Text.WordWrap
-            }
-
-            ListView {
-                id: tuneArchiveTunesList
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                Layout.alignment: Qt.AlignHCenter
-                spacing: 10
                 clip: true
 
-                model: ListModel {
-                    id: downloadedTunesModel
+                Repeater {
+                    model: ["Refloat Archive", "Hermes", "My Tunes"]
 
-                    function setTunes(tunes) {
-                        clear();
-                        for (var i in tunes) {
-                            append({"tune": tunes[i]});
+                    TabButton {
+                        text: modelData
+                    }
+                }
+
+                background: Rectangle {
+                    opacity: 1
+                    color: Utility.getAppHexColor("lightBackground");
+                }
+
+                onCurrentIndexChanged: {
+                    tuneLibraryStackLayout.currentIndex = currentIndex;
+                }
+            }
+
+            StackLayout {
+                id: tuneLibraryStackLayout
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+
+                ColumnLayout {
+                    id: refloatArchivePage
+                    spacing: 15
+
+                    property bool loaded: false
+
+                    onVisibleChanged: {
+                        if (visible) {
+                            ensureLoaded();
+                        }
+                    }
+
+                    function ensureLoaded() {
+                        if (!loaded) {
+                            loaded = true;
+                            refresh(false);
+                        }
+                    }
+
+                    function refresh(force) {
+                        var tuneArchive = force ? null : tuneManager.loadTuneArchive();
+                        // backwards compatibility: Check for the first item settings not being an array (if it is, redownload)
+                        if (tuneArchive && tuneArchive.length > 0 && !Array.isArray(tuneArchive[0].settings)) {
+                            refloatArchiveModel.setTunes(tuneArchive);
+                            refloatArchiveStatus.text = "Tunes downloaded on %1".arg(tuneManager.getTuneArchiveDate());
+                        } else {
+                            download();
+                        }
+                    }
+
+                    function download() {
+                        refloatArchiveStatus.text = "Downloading tunes...";
+                        var http = new XMLHttpRequest();
+                        var url = "http://us-central1-mimetic-union-377520.cloudfunctions.net/float_package_tunes_via_http";
+                        http.open("GET", url, true);
+                        http.onreadystatechange = function() {
+                            if (http.readyState === XMLHttpRequest.DONE) {
+                                if (http.status === 200) {
+                                    refloatArchiveStatus.text = "Download succesful.";
+
+                                    var tunes = tuneManager.parseCsv(http.responseText);
+                                    tuneManager.saveTuneArchive(tunes);
+                                    refloatArchiveModel.setTunes(tunes);
+                                } else if (http.status === 0) {
+                                    refloatArchiveStatus.text = "Download failed: Connection error";
+                                } else {
+                                    refloatArchiveStatus.text = "Download failed: %1 - %2".arg(http.status).arg(http.statusText);
+                                }
+                            }
+
+                        };
+
+                        http.send();
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        LText {
+                            id: refloatArchiveStatus
+                            Layout.fillWidth: true
+
+                            font.pointSize: 11
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Button {
+                            text: "Refresh"
+                            onClicked: refloatArchivePage.download()
+                        }
+                    }
+
+                    ListView {
+                        id: refloatArchiveList
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 10
+                        clip: true
+
+                        model: ListModel {
+                            id: refloatArchiveModel
+
+                            function setTunes(tunes) {
+                                clear();
+                                for (var i in tunes) {
+                                    append({"tune": tunes[i]});
+                                }
+                            }
+                        }
+
+                        delegate: TuneListItem {
+                            width: refloatArchiveList.width
+
+                            property var favoriteEntry: tuneManager.findMyTuneBySource({"type": "refloat-archive", "name": tune.name})
+
+                            name: tune.name
+                            favorite: favoriteEntry ? !!favoriteEntry.favorite : false
+
+                            onClicked: {
+                                applyConfigDialog.show(tune, false, true);
+                            }
+
+                            onFavoriteToggled: {
+                                if (favoriteEntry) {
+                                    tuneManager.setFavorite(favoriteEntry.uuid, !favoriteEntry.favorite);
+                                } else {
+                                    var snapshot = JSON.parse(JSON.stringify(tune));
+                                    snapshot.date = new Date();
+                                    snapshot.package = {"name": tuneManager.packageName, "version": tuneManager.packageVersion};
+                                    snapshot.source = {"type": "refloat-archive"};
+                                    snapshot.favorite = true;
+                                    tuneManager.addMyTune(snapshot);
+                                }
+                            }
                         }
                     }
                 }
 
-                delegate: Button {
-                    width: tuneArchiveTunesList.width
-                    text: tune.name
-                    onClicked: {
-                        applyConfigDialog.show(tune, false, true);
+                ColumnLayout {
+                    id: hermesArchivePage
+                    spacing: 15
+
+                    property bool loaded: false
+                    property var hermesTunes: []
+
+                    onVisibleChanged: {
+                        if (visible) {
+                            ensureLoaded();
+                        }
+                    }
+
+                    function ensureLoaded() {
+                        if (!loaded) {
+                            loaded = true;
+                            refresh(false);
+                        }
+                    }
+
+                    function refresh(force) {
+                        var archive = force ? null : tuneManager.loadHermesArchive();
+                        if (archive && archive.length > 0) {
+                            hermesTunes = archive;
+                            hermesArchiveStatus.text = "Tunes downloaded on %1".arg(tuneManager.getHermesArchiveDate());
+                        } else {
+                            download();
+                        }
+                    }
+
+                    function download() {
+                        hermesArchiveStatus.text = "Downloading tunes...";
+                        var http = new XMLHttpRequest();
+                        http.open("GET", "https://ridehermes.app/tunes", true);
+                        http.onreadystatechange = function() {
+                            if (http.readyState === XMLHttpRequest.DONE) {
+                                if (http.status === 200) {
+                                    var listing = tuneManager.parseHermesListing(http.responseText);
+                                    if (listing) {
+                                        hermesArchiveStatus.text = "Download succesful.";
+                                        tuneManager.saveHermesArchive(listing);
+                                        hermesTunes = listing;
+                                    } else {
+                                        hermesArchiveStatus.text = "Failed to parse the tune listing, the site may have changed.";
+                                    }
+                                } else if (http.status === 0) {
+                                    hermesArchiveStatus.text = "Download failed: Connection error";
+                                } else {
+                                    hermesArchiveStatus.text = "Download failed: %1 - %2".arg(http.status).arg(http.statusText);
+                                }
+                            }
+                        };
+
+                        http.send();
+                    }
+
+                    function fetchTune(entry, callback) {
+                        var cached = tuneManager.loadCachedHermesTune(entry.id);
+                        if (cached) {
+                            callback(cached);
+                            return;
+                        }
+
+                        hermesArchiveStatus.text = "Downloading \"%1\"...".arg(entry.name);
+                        var http = new XMLHttpRequest();
+                        http.open("GET", "https://ridehermes.app/tunes/%1/download".arg(entry.id), true);
+                        http.onreadystatechange = function() {
+                            if (http.readyState === XMLHttpRequest.DONE) {
+                                if (http.status === 200) {
+                                    var tune = tuneManager.parseHermesTuneXml(http.responseText, entry);
+                                    if (tune) {
+                                        hermesArchiveStatus.text = "Tunes downloaded on %1".arg(tuneManager.getHermesArchiveDate());
+                                        tuneManager.cacheHermesTune(entry.id, tune);
+                                        callback(tune);
+                                    } else {
+                                        hermesArchiveStatus.text = "Failed to parse tune \"%1\"".arg(entry.name);
+                                    }
+                                } else if (http.status === 0) {
+                                    hermesArchiveStatus.text = "Download failed: Connection error";
+                                } else {
+                                    hermesArchiveStatus.text = "Download failed: %1 - %2".arg(http.status).arg(http.statusText);
+                                }
+                            }
+                        };
+
+                        http.send();
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        LText {
+                            id: hermesArchiveStatus
+                            Layout.fillWidth: true
+
+                            font.pointSize: 11
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Button {
+                            text: "Refresh"
+                            onClicked: hermesArchivePage.download()
+                        }
+                    }
+
+                    ListView {
+                        id: hermesArchiveList
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 10
+                        clip: true
+
+                        model: hermesArchivePage.hermesTunes.length
+
+                        delegate: TuneListItem {
+                            width: hermesArchiveList.width
+
+                            property var tune: hermesArchivePage.hermesTunes[index]
+                            property var favoriteEntry: tune ? tuneManager.findMyTuneBySource({"type": "hermes", "id": tune.id}) : null
+
+                            name: tune ? tune.name : ""
+                            subtitle: tune ? "by %1 · %2 likes · %3 downloads".arg(tune.author).arg(tune.likes).arg(tune.downloads) : ""
+                            categories: tune ? tune.categories : []
+                            description: tune && tune.description ? tune.description : ""
+                            favorite: favoriteEntry ? !!favoriteEntry.favorite : false
+
+                            onClicked: {
+                                hermesArchivePage.fetchTune(tune, (fetched) => applyConfigDialog.show(fetched, false, true));
+                            }
+
+                            onFavoriteToggled: {
+                                if (favoriteEntry) {
+                                    tuneManager.setFavorite(favoriteEntry.uuid, !favoriteEntry.favorite);
+                                } else {
+                                    var id = tune.id;
+                                    hermesArchivePage.fetchTune(tune, function(fetched) {
+                                        var snapshot = JSON.parse(JSON.stringify(fetched));
+                                        snapshot.source = {"type": "hermes", "id": id};
+                                        snapshot.favorite = true;
+                                        tuneManager.addMyTune(snapshot);
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ColumnLayout {
+                    id: myTunesPage
+                    spacing: 15
+
+                    ListView {
+                        id: myTunesList
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        Layout.topMargin: 15
+                        spacing: 10
+                        clip: true
+                        visible: tuneManager.myTunes.length > 0
+
+                        model: tuneManager.myTunes.length
+
+                        delegate: TuneListItem {
+                            width: myTunesList.width
+
+                            property var tune: tuneManager.myTunes[index]
+
+                            name: tune ? tune.name : ""
+                            // Never empty: a hidden subtitle drops a child out of the
+                            // row layout, and TuneListItem's height then oscillates
+                            // between the text column and the tool buttons (Qt reports
+                            // a binding loop and stops updating the height). Tunes from
+                            // migrateTuneSlots() have no date, hence the source label as
+                            // a floor. The date is guarded like elsewhere in this file -
+                            // Qt.formatDateTime(new Date(undefined)) returns "".
+                            subtitle: {
+                                if (!tune) {
+                                    return "";
+                                }
+                                var parts = [];
+                                if (tune.date) {
+                                    parts.push(Qt.formatDateTime(new Date(tune.date)));
+                                }
+                                if (tune.source && tune.source.type === "hermes") {
+                                    parts.push("Hermes");
+                                } else if (tune.source && tune.source.type === "refloat-archive") {
+                                    parts.push("Refloat Archive");
+                                }
+                                if (parts.length === 0) {
+                                    parts.push("Local");
+                                }
+                                return parts.join(" · ");
+                            }
+                            favorite: tune ? !!tune.favorite : false
+                            editable: true
+
+                            onClicked: {
+                                applyConfigDialog.show(tune, false, true);
+                            }
+
+                            onHeld: {
+                                editTuneDialog.show(tune.uuid);
+                            }
+
+                            onFavoriteToggled: {
+                                tuneManager.setFavorite(tune.uuid, !tune.favorite);
+                            }
+                        }
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        Layout.margins: 20
+                        visible: tuneManager.myTunes.length === 0
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                        wrapMode: Text.WordWrap
+                        text: "No tunes saved yet. Use \"Save Current Tune\" or favorite tunes from the archives."
                     }
                 }
             }
@@ -5735,7 +6433,8 @@ Item {
         property BaseDialog dialog
         property bool isTune: false
 
-        property bool isEmpty: diffModel.count === 0
+        property bool isEmpty: diffCount === 0
+        property int diffCount: 0
 
         property real rowHeight: 30
         property real valueColumnWidth: 60
@@ -5787,14 +6486,32 @@ Item {
         function setModel(m) {
             var model = diffModel;
             model.clear();
-            var empty = true;
+            var count = 0;
+            var lastGroup = null;
+            var groupRow = 0;
             for (var item of m) {
+                if (item.group !== lastGroup) {
+                    model.append({
+                        "isHeader": true,
+                        "name": item.group,
+                        "value": "",
+                        "otherValue": "",
+                        "alt": false
+                    });
+                    lastGroup = item.group;
+                    groupRow = 0;
+                }
+                item.isHeader = false;
+                // alternate row colors per group, headers break the index parity
+                item.alt = groupRow % 2 === 1;
                 item.value = displayValue(item, item.value);
                 item.otherValue = displayValue(item, item.otherValue);
                 model.append(item);
-                empty = false;
+                count++;
+                groupRow++;
             }
-            if (empty) {
+            diffCount = count;
+            if (count === 0) {
                 diffCheckbox.checked = false;
             }
         }
@@ -5820,7 +6537,7 @@ Item {
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.leftMargin: 22
-                    text: "Differences (%1)".arg(diffModel.count)
+                    text: "Differences (%1)".arg(configDiff.diffCount)
                     color: Utility.getAppHexColor("lightText")
                     verticalAlignment: Text.AlignVCenter
                 }
@@ -5897,13 +6614,26 @@ Item {
                 }
 
                 delegate: Rectangle {
-                    color: index % 2 === 0 ? Utility.getAppHexColor("lightBackground") : Utility.getAppHexColor("normalBackground")
+                    color: isHeader
+                        ? Utility.getAppHexColor("lightestBackground")
+                        : alt ? Utility.getAppHexColor("normalBackground") : Utility.getAppHexColor("lightBackground")
                     implicitWidth: diffView.width
                     implicitHeight: rowHeight
+
+                    NText {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 5
+                        height: rowHeight
+                        visible: isHeader
+                        verticalAlignment: Text.AlignVCenter
+                        text: isHeader ? name : ""
+                        color: Utility.getAppHexColor("lightAccent")
+                    }
 
                     Row {
                         id: diffRow
                         anchors.centerIn: parent
+                        visible: !isHeader
 
                         NText {
                             width: diffView.width - 2 * valueColumnWidth - 10
@@ -5913,7 +6643,7 @@ Item {
                             wrapMode: Text.WordWrap
                             fontSizeMode: Text.Fit
                             minimumPointSize: 4
-                            text: packageConfig.getDisplayName(name)
+                            text: isHeader ? "" : packageConfig.getDisplayName(name)
                             color: Utility.getAppHexColor("lightText")
                         }
 
@@ -6006,9 +6736,11 @@ Item {
         }
 
         onApplied: {
-            packageConfig.applyConfig(config);
+            if (packageConfig.applyConfig(config) && isTune) {
+                tuneManager.setCurrentTune(config);
+            }
             close();
-            tuneArchiveDialog.close();
+            tuneLibraryDialog.close();
         }
 
         // "Keep Defaults" — uses RejectRole for middle position on Android
@@ -7521,138 +8253,214 @@ Item {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
-                GridLayout {
-                    property int spacing: 0.6 * unit
-                    anchors.fill: parent
-                    anchors.topMargin: spacing
-                    anchors.leftMargin: spacing
-                    anchors.rightMargin: spacing
-                    anchors.bottomMargin: spacing - bottomLine.height - root.spacing
-                    rowSpacing: spacing
-                    columnSpacing: spacing
-                    columns: (preferences.tuneSlotCount === 2 && height > width * 0.6) ? 1 : 2
+                RowLayout {
+                    id: currentTuneRow
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.topMargin: 0.3 * unit
+                    anchors.leftMargin: 0.6 * unit
+                    // leave room for the FAB
+                    anchors.rightMargin: 1.5 * unit
+                    spacing: 0.2 * unit
 
-                    Repeater {
-                        model: preferences.tuneSlotCount
+                    LText {
+                        text: "Tune:"
+                    }
 
-                        Button {
-                            id: button
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            Layout.minimumHeight: buttonItemHeight + 2 * buttonItemMargin
-                            Layout.columnSpan: (slot === preferences.tuneSlotCount && (slot % 2) === 1) ? 2 : 1
+                    NText {
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                        text: tuneManager.currentTune ? tuneManager.currentTune.name : "None"
+                        color: tuneManager.currentTune ? Utility.getAppHexColor("lightText") : Utility.getAppHexColor("disabledText")
+                    }
 
-                            property int slot: index + 1
+                    DText {
+                        property int diff: tuneManager.currentTune ? packageConfig.diffConfig(tuneManager.currentTune).differs.length : 0
 
-                            property var tuneName: tuneManager.tunes[slot] ? tuneManager.tunes[slot].name : ""
-                            property var tuneDiff: tuneManager.tunes[slot] ? packageConfig.diffConfig(tuneManager.tunes[slot]).differs.length : -1
+                        font.pixelSize: fontSizeSmall
+                        visible: diff > 0
+                        text: preferences.showTuneDiffCount ? "modified (%1)".arg(diff) : "modified"
+                    }
+                }
 
-                            property real buttonItemHeight: unit
-                            property real buttonItemMargin: 0.15 * unit
+                ScrollView {
+                    id: tunesScroll
+                    anchors.top: currentTuneRow.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.topMargin: 0.3 * unit
+                    anchors.bottomMargin: -bottomLine.height - root.spacing
+                    clip: true
+                    contentWidth: availableWidth
+                    // Derived from the row geometry, not from tunesGrid.implicitHeight:
+                    // tunesGrid is this ScrollView's content item, so binding back to
+                    // its implicitHeight fights the built-in content sizing and Qt
+                    // reports a binding loop. Same value, one row per rowHeight plus
+                    // a spacing above each row and one below the last.
+                    contentHeight: tunesGrid.rowCount * tunesGrid.rowHeight
+                        + (tunesGrid.rowCount + 1) * tunesGrid.gridSpacing
+                    visible: tuneManager.favoriteTunes.length > 0
 
-                            padding: 0
-                            leftInset: 0
-                            rightInset: 0
-                            topInset: 0
-                            bottomInset: 0
+                    GridLayout {
+                        id: tunesGrid
+                        // Named gridSpacing, not spacing: GridLayout already has a
+                        // spacing property, and redeclaring it here shadows the
+                        // inherited one - rowSpacing/columnSpacing below only work
+                        // because they are set from it explicitly.
+                        property int gridSpacing: 0.6 * unit
+                        // fill the page while the tunes fit, scroll beyond that
+                        property real rowCount: Math.max(1, Math.ceil(tuneManager.favoriteTunes.length / columns))
+                        property real rowHeight: Math.max(1.4 * unit,
+                            (tunesScroll.availableHeight - (rowCount + 1) * gridSpacing) / rowCount)
 
-                            onPressAndHold: {
-                                editTuneDialog.show(slot, tuneName);
-                            }
+                        width: tunesScroll.availableWidth - 2 * gridSpacing
+                        x: gridSpacing
+                        y: gridSpacing
+                        rowSpacing: gridSpacing
+                        columnSpacing: gridSpacing
+                        columns: (tuneManager.favoriteTunes.length === 2 && tunesPage.height > tunesPage.width * 0.6) ? 1 : 2
 
-                            onClicked: {
-                                if (tuneName) {
-                                    var tune = tuneManager.loadTune(slot);
-                                    packageConfig.applyConfig(tune);
+                        Repeater {
+                            model: tuneManager.favoriteTunes.length
+
+                            Button {
+                                id: button
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: tunesGrid.rowHeight
+                                Layout.columnSpan: (index === tuneManager.favoriteTunes.length - 1 && (tuneManager.favoriteTunes.length % 2) === 1) ? 2 : 1
+
+                                property var tune: tuneManager.favoriteTunes[index]
+
+                                property var tuneName: tune ? tune.name : ""
+                                property var tuneDiff: tune ? packageConfig.diffConfig(tune).differs.length : -1
+
+                                property real buttonItemHeight: unit
+                                property real buttonItemMargin: 0.15 * unit
+
+                                padding: 0
+                                leftInset: 0
+                                rightInset: 0
+                                topInset: 0
+                                bottomInset: 0
+
+                                onPressAndHold: {
+                                    if (tune) {
+                                        editTuneDialog.show(tune.uuid);
+                                    }
                                 }
-                            }
 
-                            contentItem: Item {
-                                anchors.fill: parent
-                                anchors.margins: parent.buttonItemMargin
-                                clip: true
-                                z: 2
+                                onClicked: {
+                                    if (tune && packageConfig.applyConfig(tune)) {
+                                        tuneManager.setCurrentTune(tune);
+                                    }
+                                }
 
-                                Item {
-                                    anchors.centerIn: parent
-                                    width: parent.width
-                                    height: button.buttonItemHeight
+                                contentItem: Item {
+                                    anchors.fill: parent
+                                    anchors.margins: parent.buttonItemMargin
+                                    clip: true
+                                    z: 2
 
-                                    Text {
-                                        id: tuneButtonText
+                                    Item {
+                                        anchors.centerIn: parent
                                         width: parent.width
-                                        anchors.centerIn: tuneName ? parent : undefined
-                                        anchors.top: tuneName ? undefined : parent.top
+                                        height: button.buttonItemHeight
 
-                                        color: tuneName ? Utility.getAppHexColor("lightText") : Utility.getAppHexColor("disabledText")
-                                        font.pixelSize: 0.5 * unit
-                                        horizontalAlignment: Text.AlignHCenter
-                                        wrapMode: Text.WordWrap
-                                        text: tuneName || "empty slot"
+                                        Text {
+                                            id: tuneButtonText
+                                            width: parent.width
+                                            anchors.centerIn: parent
+
+                                            color: Utility.getAppHexColor("lightText")
+                                            font.pixelSize: 0.5 * unit
+                                            horizontalAlignment: Text.AlignHCenter
+                                            wrapMode: Text.WordWrap
+                                            text: tuneName
+                                        }
                                     }
 
                                     DText {
-                                        id: tuneButtonHelpText
-                                        width: parent.width
+                                        id: tuneButtonDiffCount
                                         anchors.bottom: parent.bottom
+                                        anchors.right: parent.right
 
-                                        font.pixelSize: fontSizeSuperSmall
-                                        visible: !tuneName
-                                        horizontalAlignment: Text.AlignHCenter
-                                        text: "press and hold to set"
+                                        font.pixelSize: fontSizeSmall
+                                        visible: preferences.showTuneDiffCount && tuneDiff > 0
+                                        horizontalAlignment: Text.AlignHRight
+                                        text: tuneDiff
                                     }
                                 }
 
-                                DText {
-                                    id: tuneButtonDiffCount
-                                    anchors.bottom: parent.bottom
-                                    anchors.right: parent.right
+                                background: Rectangle {
+                                    id: buttonBg
+                                    z: 1
 
-                                    font.pixelSize: fontSizeSmall
-                                    visible: preferences.showTuneDiffCount && tuneDiff > 0
-                                    horizontalAlignment: Text.AlignHRight
-                                    text: tuneDiff
-                                }
-                            }
+                                    border.color: tuneDiff === 0 ? Utility.getAppHexColor("lightAccent") : Utility.getAppHexColor("lightText")
+                                    border.width: 2
+                                    radius: 3
 
-                            background: Rectangle {
-                                id: buttonBg
-                                z: 1
+                                    color: Utility.getAppHexColor("normalBackground")
 
-                                border.color: tuneDiff === 0 ? Utility.getAppHexColor("lightAccent") : tuneName ? Utility.getAppHexColor("lightText") : Utility.getAppHexColor("disabledText")
-                                border.width: 2
-                                radius: 3
+                                    states: [
+                                        State {
+                                            name: "change"
+                                            when: button.pressed
+                                            PropertyChanges {target: buttonBg; color: Utility.getAppHexColor("lightestBackground");}
+                                        }
+                                    ]
 
-                                color: Utility.getAppHexColor("normalBackground")
-
-                                states: [
-                                    State {
-                                        name: "change"
-                                        when: button.pressed
-                                        PropertyChanges {target: buttonBg; color: Utility.getAppHexColor("lightestBackground");}
+                                    transitions: Transition {
+                                        ColorAnimation {property: "color"; duration: 200; easing.type: Easing.InOutCirc;}
                                     }
-                                ]
-
-                                transitions: Transition {
-                                    ColorAnimation {property: "color"; duration: 200; easing.type: Easing.InOutCirc;}
                                 }
-                            }
 
-                            Glow {
-                                anchors.fill: buttonBg
-                                radius: Math.round(0.25 * unit)
-                                samples: radius * 2 + 1
-                                opacity: 0.3
-                                color: Utility.getAppHexColor("lightAccent")
-                                visible: tuneDiff === 0
-                                source: buttonBg
+                                Glow {
+                                    anchors.fill: buttonBg
+                                    radius: Math.round(0.25 * unit)
+                                    samples: radius * 2 + 1
+                                    opacity: 0.3
+                                    color: Utility.getAppHexColor("lightAccent")
+                                    visible: tuneDiff === 0
+                                    source: buttonBg
+                                }
                             }
                         }
                     }
                 }
 
+                ColumnLayout {
+                    anchors.centerIn: parent
+                    width: parent.width * 0.8
+                    visible: tuneManager.favoriteTunes.length === 0
+                    spacing: 0.3 * unit
+
+                    NText {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        text: "No favorite tunes"
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: fontSizeSmall
+                        text: "Save your current tune or star tunes in the Tune Library"
+                    }
+
+                    Button {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: "Open Tune Library"
+                        onClicked: {
+                            tuneLibraryDialog.show(0);
+                        }
+                    }
+                }
+
                 FloatingToolButton {
-                    id: downloadTunesButton
+                    id: tunesMenuButton
                     anchors.right: parent.right
                     anchors.top: parent.top
                     size: unit
@@ -7662,7 +8470,27 @@ Item {
                     }
 
                     onClicked: {
-                        tuneArchiveDialog.show();
+                        tunesFabMenu.visible = true;
+                    }
+
+                    Menu {
+                        id: tunesFabMenu
+                        x: parent.width - width
+                        y: parent.height
+
+                        MenuItem {
+                            text: "Tune Library"
+                            onTriggered: {
+                                tuneLibraryDialog.show(0);
+                            }
+                        }
+
+                        MenuItem {
+                            text: "Save Current Tune…"
+                            onTriggered: {
+                                editTuneDialog.show(null);
+                            }
+                        }
                     }
                 }
             }
