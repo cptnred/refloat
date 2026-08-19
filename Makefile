@@ -19,6 +19,7 @@ src:
 
 VERSION=`cat version`
 PACKAGE_NAME=`cat package_name | cut -c-20`
+TILE_API_KEY=`cat tile_api_key`
 
 ifeq ($(strip $(MINIFY_QML)),1)
     MINIFY_CMD="./rjsmin.py"
@@ -34,10 +35,15 @@ package_README-gen.md: package_README.md version
 	echo "- Build Date: `date --rfc-3339=seconds`" >> $@
 	echo "- Git Commit: #`git rev-parse --short HEAD`" >> $@
 
-ui.qml: ui.qml.in package_name version
+# the key file is untracked; create it empty so a fresh clone builds
+tile_api_key:
+	@touch $@
+
+ui.qml: ui.qml.in package_name version tile_api_key
 	cat $< | \
 	sed "s/{{PACKAGE_NAME}}/${PACKAGE_NAME}/g" | \
 	sed "s/{{VERSION}}/${VERSION}/g" | \
+	sed "s/{{TILE_API_KEY}}/${TILE_API_KEY}/g" | \
 	${MINIFY_CMD} > $@
 
 clean:

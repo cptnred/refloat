@@ -17,6 +17,8 @@
 // this program. If not, see <http://www.gnu.org/licenses/>.
 
 import Qt.labs.settings 1.0
+// in the deployment because VESC Tool's own file pickers use it
+import Qt.labs.folderlistmodel 2.1
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
@@ -28,6 +30,7 @@ import Vedder.vesc.vescinterface 1.0
 import Vedder.vesc.codeloader 1.0
 import Vedder.vesc.commands 1.0
 import Vedder.vesc.configparams 1.0
+import Vedder.vesc.logwriter 1.0
 import Vedder.vesc.utility 1.0
 import QtQuick.Controls.Material 2.2
 
@@ -783,6 +786,13 @@ Item {
         function onValuesSetupReceived(values, mask) {
             batteryBar.value = values.battery_level * 100;
 
+            // a signal argument is the only way to read SETUP_VALUES from QML,
+            // see logRecorder.setupColumnNames
+            if (logRecorder.recording) {
+                logRecorder.setupValues = [values.battery_level, values.amp_hours,
+                                           values.watt_hours, values.tachometer];
+            }
+
             odometer.value = values.odometer * 0.001 * vescConfig.imperialFactor;
             tachometer.value = values.tachometer_abs * 0.001 * vescConfig.imperialFactor;
 
@@ -885,8 +895,10 @@ Item {
                 }
 
                 var running = +(state.pkgState === state.s_Running);
-                rtPlotData.addSample([time, running, wheelslip, sat, fpState].concat(newRt));
+                var rtSample = [time, running, wheelslip, sat, fpState].concat(newRt);
+                rtPlotData.addSample(rtSample);
                 rtPlotData.makeReady();
+                logRecorder.addSample(rtSample);
             } else if (msgtype === c_REALTIME_DATA_INTERNAL_IDS) {
                 if (state.commsState !== state.comms_RTDataIDs) {
                     return;
@@ -925,6 +937,10 @@ Item {
         property int tempWarningOffset: 10
         property alias showTuneDiffCount: prefShowTuneDiffCount.checked
         property int plotMaxWindowMinutes: 30
+        property alias showMapTiles: prefShowMapTiles.checked
+        // tile key for development, only used while the {{TILE_API_KEY}}
+        // placeholder is unreplaced (refloatui.qml loaded directly)
+        property string devTileApiKey: ""
         property alias showWelcomeDialog: prefShowWelcomeDialog.checked
         property alias checkForNewVersions: prefCheckForNewVersions.checked
     }
@@ -1007,6 +1023,271 @@ Item {
             if (cmpVersion(parseVersion(version), parseVersion(pkgVersion)) == 1) {
                 newPackageVersionDialog.show(version);
             }
+        }
+    }
+
+    QtObject {
+        id: logRecorder
+
+        property bool recording: false
+        property string filePath: ""
+        property int sampleCount: 0
+        // ms_today (UTC) of the first written sample, for the elapsed-time display
+        property real startTime: 0
+
+        // Columns that don't come from Refloat's realtime data but from VESC
+        // Tool's SETUP_VALUES. The names are the ones its own RT log CSV uses,
+        // this file follows the same schema.
+        //
+        // The position is deliberately not among them: it exists only inside
+        // VESC Tool's LOG_DATA, and every VescIf method returning that type is
+        // unusable from QML - the call throws "Unknown method return type:
+        // LOG_DATA", because neither LOG_DATA nor SETUP_VALUES is registered
+        // with qRegisterMetaType (vesc_tool/main.cpp:271 registers MC_VALUES
+        // and others, not these two). A *signal argument* of the same type
+        // does work, which is how the setup values below arrive. The track
+        // therefore still comes from VESC Tool's own CSV, see LogFilePlotData.
+        readonly property var setupColumnNames: [
+            "battery_level", "amp_hours_setup", "watt_hours_setup", "tacho_meters",
+        ]
+
+        // Newest SETUP_VALUES, filled by the valuesSetupReceived handler while
+        // recording; VESC Tool polls them at 20Hz as long as its RT log is
+        // open (vesc_tool/mobile/main.qml:864)
+        property var setupValues: [NaN, NaN, NaN, NaN]
+
+        // Names of the realtime channels to write - all of them: the file is
+        // self-contained, nothing is left out to avoid duplicates any more
+        property var columnNames: []
+
+        // The lines written since the last flush. LogWriter holds the file
+        // open and appends, so only the new part is handed over - unlike the
+        // XHR PUT on a file:// URL this replaced, which always rewrote the
+        // whole file and therefore had to keep all of it in memory.
+        property string buffer: ""
+
+        // VESC Tool's C++ file writer: a PUT on file:// reports status 0
+        // whether it worked or not
+        property LogWriter logFile: LogWriter {}
+
+        property Settings vescToolSettings: Settings {
+            // no category: reads the same key as the RT log box of VESC Tool,
+            // so that Refloat doesn't introduce a second log directory
+            id: vescToolSettings
+            property string path_rt_log: ""
+        }
+
+        property var logDirDialog: Dl.FileDialog {
+            title: "Choose a directory for logs"
+            selectFolder: true
+            selectExisting: true
+
+            onAccepted: {
+                // store the URL unchanged - that is what VESC Tool's own
+                // directory picker writes into this key, and openRtLogFile()
+                // strips the scheme itself (see logDirUrl)
+                logRecorder.vescToolSettings.path_rt_log = fileUrl.toString();
+                logRecorder.start();
+            }
+        }
+
+        property Connections stateConnection: Connections {
+            target: state
+
+            function onCommsInitialized() {
+                logRecorder.buildColumns();
+            }
+        }
+
+        // Mirrors VESC Tool's LogBox: if the RT log gets closed elsewhere
+        // (e.g. from the VESC Tool UI), stop this recording as well so the
+        // GNSS service and wake lock don't keep running
+        property Timer watchdog: Timer {
+            repeat: true
+            running: logRecorder.recording
+            interval: 500
+
+            onTriggered: {
+                if (!VescIf.isRtLogOpen()) {
+                    logRecorder.stop();
+                }
+            }
+        }
+
+        function buildColumns() {
+            // The header is written once in start(). A reconnect re-runs this,
+            // and a different channel set would misalign every following row.
+            if (recording) {
+                return;
+            }
+            columnNames = state.rtDataAllItems;
+        }
+
+        // Same time reference as the ms_today column VESC Tool writes:
+        // milliseconds since start of day in UTC
+        function utcMsToday() {
+            var d = new Date();
+            return d.getUTCHours() * 3600000 + d.getUTCMinutes() * 60000 +
+                   d.getUTCSeconds() * 1000 + d.getUTCMilliseconds();
+        }
+
+        // path_rt_log holds either a plain path or a file:// URL: VESC Tool's
+        // own directory picker stores FolderListModel.folder, which is a URL,
+        // while a hand-typed path has no scheme. openRtLogFile() strips the
+        // scheme itself and takes both, but FolderListModel and FileDialog
+        // need a proper URL - prefixing one that is already there yields
+        // file:///file:///... and silently shows nothing.
+        function logDirUrl() {
+            var dir = vescToolSettings.path_rt_log;
+            if (dir === "") {
+                return "";
+            }
+            if (dir.indexOf("file:") === 0) {
+                return dir;
+            }
+            return "file://" + (dir.charAt(0) === "/" ? "" : "/") + dir;
+        }
+
+        // Plain path for a file:// URL, for display and for LogWriter (which
+        // wants a bare path). decodeURIComponent() throws on a stray "%" in a
+        // directory name - inside a binding that aborts it and leaves the text
+        // empty, so an undecodable path is passed through as-is.
+        function logPathOf(url) {
+            var path = url.replace(/^file:\/\//, "");
+            try {
+                return decodeURIComponent(path);
+            } catch (e) {
+                return path;
+            }
+        }
+
+        function csvNum(value) {
+            if (value !== value) {
+                return "";
+            }
+            // toFixed(4) for a sane maximum precision, parseFloat to drop
+            // trailing zeros
+            return parseFloat(value.toFixed(4)).toString();
+        }
+
+        function start() {
+            if (recording) {
+                return;
+            }
+
+            if (!VescIf.isPortConnected()) {
+                VescIf.emitMessageDialog("Refloat Logging",
+                                         "You must be connected to the VESC in order to log data.",
+                                         false, false);
+                return;
+            }
+
+            if (columnNames.length === 0) {
+                VescIf.emitStatusMessage("Logging Failed: no realtime data", false);
+                return;
+            }
+
+            if (!Utility.requestFilePermission()) {
+                VescIf.emitMessageDialog("File Permissions",
+                                         "Unable to request file system permission.",
+                                         false, false);
+                return;
+            }
+
+            var dir = vescToolSettings.path_rt_log;
+            if (dir === "") {
+                // start() is called again from the dialog once a directory is set
+                logDirDialog.open();
+                return;
+            }
+
+            // VESC Tool only creates the position source and collects
+            // positions while its RT log is open (vescinterface.cpp:1843);
+            // without it addSample() has nothing to read. That its own CSV is
+            // written alongside is a side effect, it is not read back.
+            if (!VescIf.openRtLogFile(dir)) {
+                VescIf.emitStatusMessage("Logging Failed", false);
+                return;
+            }
+
+            filePath = VescIf.rtLogFilePath().replace(/\.csv$/, "_refloat.csv");
+            if (!logFile.openLogFileFullPath(filePath)) {
+                // the RT log is already open at this point, don't leave it
+                // running for a recording that never starts
+                VescIf.closeRtLogFile();
+                VescIf.emitStatusMessage("Logging Failed: could not write the log file", false);
+                return;
+            }
+
+            Utility.startGnssForegroundService();
+            VescIf.setWakeLock(true);
+
+            buffer = ["ms_today", "state.running", "state.wheelslip", "state.sat", "footpad.state"]
+                .concat(columnNames).concat(setupColumnNames).join(";") + "\n";
+            sampleCount = 0;
+            startTime = utcMsToday();
+            // not carried over from the previous recording: until the first
+            // SETUP_VALUES arrives these columns stay empty rather than stale
+            setupValues = [NaN, NaN, NaN, NaN];
+            recording = true;
+            flush();
+        }
+
+        function stop() {
+            if (!recording) {
+                return;
+            }
+
+            recording = false;
+            flush();
+            logFile.closeLogFile();
+            VescIf.closeRtLogFile();
+            VescIf.emitStatusMessage("Log Saved", true);
+            Utility.stopGnssForegroundService();
+
+            if (!VescIf.useWakeLock()) {
+                VescIf.setWakeLock(false);
+            }
+        }
+
+        // Expects the same sample layout as rtPlotData.addSample():
+        // [time, running, wheelslip, sat, fpState, ...rt values]. The firmware
+        // tick time is not written - the file gets utcMsToday() instead, to
+        // share the time axis with the RT log.
+        function addSample(sample) {
+            if (!recording) {
+                return;
+            }
+
+            var fields = [utcMsToday(), sample[1], sample[2], sample[3], sample[4]];
+            for (var i = 5; i < sample.length; i++) {
+                fields.push(csvNum(sample[i]));
+            }
+
+            var setup = setupValues;
+            for (var j = 0; j < setup.length; j++) {
+                fields.push(csvNum(setup[j]));
+            }
+
+            buffer += fields.join(";") + "\n";
+            sampleCount++;
+
+            // Write in blocks of 100 samples (10s at 10Hz), so an abort still
+            // leaves a valid file that's at most 10s short
+            if (sampleCount % 100 === 0) {
+                flush();
+            }
+        }
+
+        function flush() {
+            if (buffer === "") {
+                return;
+            }
+
+            if (!logFile.writeToLogFile(buffer)) {
+                VescIf.emitStatusMessage("Log write failed", false);
+            }
+            buffer = "";
         }
     }
 
@@ -2498,6 +2779,14 @@ Item {
         ["state.wheelslip", {"name": "Wheelslip", "color": "#893075", "visible": false}],
         ["footpad.state", {"name": "Footpad State", "color": "#584f99", "visible": false}],
         ["state.sat", {"name": "Setpoint Adjustment Type", "color": "#c08959", "visible": false}],
+
+        // Channels that come from VESC Tool instead of the Refloat firmware
+        // (only present when viewing log files).
+        ["gnss_gVel", {"name": "GPS Speed", "color": "#5e88d8", "visible": true, "scalingGroup": "speed"}],
+        ["battery_level", {"name": "Battery Level", "color": "#6e6ee0", "visible": false}],
+        ["amp_hours_setup", {"name": "Amp Hours Used", "color": "#cf44cd", "visible": false}],
+        ["watt_hours_setup", {"name": "Watt Hours Used", "color": "#b29ad7", "visible": false}],
+        ["tacho_meters", {"name": "Distance", "color": "#88bb93", "visible": false}],
     ]
 
     property var plotSeriesExtraColors: [
@@ -3271,6 +3560,309 @@ Item {
         }
     }
 
+    component LogFilePlotData : PlotData {
+        id: logFilePlotData
+
+        property string fileName: ""
+        // progress/error line shown by the overlay while nothing is plotted
+        property string loadStatus: ""
+        // notice when the RT log next to the file is missing (data is shown anyway)
+        property string loadInfo: ""
+        property bool loadFailed: false
+
+        // GNSS track for the map, deliberately not a plot series:
+        // [{t, lat, lon, alt, gVel}, ...] with null entries marking gaps
+        property var track: []
+
+        // The flags come out of the file like any other column; the base
+        // implementation would otherwise prepend them again as synthetic series
+        extraFlags: []
+
+        // the Refloat file, and VESC Tool's RT log next to it for the track
+        property var parseCtx: null
+        property var trackCtx: null
+        // number of samples already handed to addSample()
+        property int fedSamples: 0
+
+        // Parse line-wise in chunks so the UI can paint in between. The timer
+        // replaces a loop over the whole file.
+        property Timer parseTimer: Timer {
+            interval: 1
+            repeat: true
+            onTriggered: logFilePlotData.parseChunk(2000)
+        }
+
+        // --- pure JS log parsing, no QML references ------------------------
+        // These four functions are copied verbatim into a scratchpad test and
+        // run under node against generated CSV files - keep them identical and
+        // free of QML dependencies.
+
+        function logParseHeader(line) {
+            var names = line.split(";");
+            for (var i = 0; i < names.length; i++) {
+                names[i] = names[i].trim();
+            }
+            return names;
+        }
+
+        // ms_today folds back to 0 at midnight; unfold into a monotonic axis.
+        // The 12h threshold guards against small non-monotonicity, only an
+        // actual day rollover moves the offset.
+        function logUnfoldTime(ctx, t) {
+            if (ctx.lastT >= 0 && t < ctx.lastT - 43200000) {
+                ctx.dayOffset += 86400000;
+            }
+            ctx.lastT = t;
+            return t + ctx.dayOffset;
+        }
+
+        function logParseChunk(ctx, rtSamples, maxLines) {
+            var lines = ctx.lines;
+            var end = Math.min(ctx.pos + maxLines, lines.length);
+
+            for (; ctx.pos < end; ctx.pos++) {
+                var parts = lines[ctx.pos].split(";");
+                if (parts.length < 2) {
+                    continue;
+                }
+
+                var t = logUnfoldTime(ctx, parseFloat(parts[0]));
+                if (t !== t) {
+                    continue;
+                }
+
+                var sample = [t];
+                // truncated lines (aborted recording) are padded with NaN so
+                // the columns stay aligned with the series
+                for (var i = 1; i < ctx.colCount; i++) {
+                    sample.push(i < parts.length ? parseFloat(parts[i]) : NaN);
+                }
+
+                // GPS speed as the last series: nearest RT log sample, both
+                // files are time-sorted so one forward-moving pointer suffices
+                if (ctx.hasRt) {
+                    var j = ctx.rtPos;
+                    while (j + 1 < rtSamples.length &&
+                           Math.abs(rtSamples[j + 1][0] - t) <= Math.abs(rtSamples[j][0] - t)) {
+                        j++;
+                    }
+                    ctx.rtPos = j;
+                    // outside the 100ms tolerance the series stays empty here
+                    sample.push(rtSamples.length > 0 && Math.abs(rtSamples[j][0] - t) <= 100
+                                ? rtSamples[j][1] : NaN);
+                }
+
+                ctx.out.push(sample);
+            }
+
+            return ctx.pos >= lines.length;
+        }
+
+        // VESC Tool's RT log, read for the GNSS columns only - everything else
+        // is in the Refloat file
+        function logParseTrackChunk(ctx, maxLines) {
+            var lines = ctx.lines;
+            var end = Math.min(ctx.pos + maxLines, lines.length);
+            var tc = ctx.trackCols;
+
+            for (; ctx.pos < end; ctx.pos++) {
+                var parts = lines[ctx.pos].split(";");
+                if (parts.length <= tc.lon) {
+                    continue;
+                }
+
+                var t = logUnfoldTime(ctx, parseFloat(parts[0]));
+                if (t !== t) {
+                    continue;
+                }
+
+                var gVel = tc.gVel >= 0 ? parseFloat(parts[tc.gVel]) : NaN;
+                ctx.samples.push([t, gVel]);
+
+                var lat = parseFloat(parts[tc.lat]);
+                var lon = parseFloat(parts[tc.lon]);
+                var trk = ctx.track;
+                // A position older than 3s counts as none: VESC Tool sets
+                // posTime to -1 and writes zeros for lat/lon
+                // (vescinterface.cpp:426). Those samples are a gap in the
+                // track, without it the line runs across the whole map.
+                var noFix = tc.posTime >= 0 && !(parseFloat(parts[tc.posTime]) >= 0);
+                if (noFix || (lat === 0 && lon === 0) || lat !== lat || lon !== lon) {
+                    if (trk.length > 0 && trk[trk.length - 1] !== null) {
+                        trk.push(null);
+                    }
+                } else {
+                    trk.push({
+                        t: t,
+                        lat: lat,
+                        lon: lon,
+                        alt: tc.alt >= 0 ? parseFloat(parts[tc.alt]) : NaN,
+                        gVel: gVel,
+                    });
+                }
+            }
+
+            return ctx.pos >= lines.length;
+        }
+
+        // --- end of pure JS log parsing ------------------------------------
+
+        // back to the log list: dataReady and loadStatus are what the list's
+        // visibility hangs on, so clearing them (also mid-load or after a
+        // failed load) is the only way to pick another file on mobile, where
+        // the file dialog doesn't work
+        function unload() {
+            parseTimer.stop();
+            reset();
+            track = [];
+            fedSamples = 0;
+            loadFailed = false;
+            loadInfo = "";
+            loadStatus = "";
+        }
+
+        function load(fileUrl) {
+            parseTimer.stop();
+            reset();
+            track = [];
+            fedSamples = 0;
+            loadFailed = false;
+            loadInfo = "";
+            loadStatus = "loading...";
+
+            fileName = decodeURIComponent(fileUrl.replace(/^.*\//, ""));
+
+            // The position lives only in VESC Tool's own CSV (see
+            // logRecorder.setupColumnNames for why). It carries the same
+            // timestamp in its name and is read for the track alone.
+            var rtUrl = fileUrl.replace(/_refloat\.csv$/, ".csv");
+            var pending = 2;
+            var texts = {};
+            var done = function() {
+                if (--pending === 0) {
+                    logFilePlotData.beginParse(texts.refloat, texts.rt);
+                }
+            };
+            fetchFile(fileUrl, function(text) { texts.refloat = text; done(); });
+            fetchFile(rtUrl, function(text) { texts.rt = text; done(); });
+        }
+
+        function fetchFile(url, callback) {
+            var request = new XMLHttpRequest();
+            request.onreadystatechange = function() {
+                if (request.readyState === XMLHttpRequest.DONE) {
+                    // file:// URLs report status 0 on success on some platforms
+                    var ok = request.status === 200 || request.status === 0;
+                    callback(ok && request.responseText.length > 0 ? request.responseText : null);
+                }
+            };
+            request.open("GET", url);
+            request.send();
+        }
+
+        function beginParse(text, rtText) {
+            if (text === null) {
+                loadFailed = true;
+                loadStatus = "failed to open log file";
+                return;
+            }
+
+            var lines = text.split("\n");
+            var names = logParseHeader(lines[0]);
+            // The VESC Tool RT log uses the same schema and sits in the same
+            // directory, so it can be picked in the file dialog - but it has
+            // none of Refloat's channels to plot.
+            if (names.indexOf("footpad.state") < 0) {
+                loadFailed = true;
+                loadStatus = "not a Refloat log file";
+                return;
+            }
+
+            // the time column counts milliseconds, so the existing plot
+            // mechanics work without a special case
+            ticksPerSecond = 1000;
+
+            if (rtText !== null) {
+                var rtLines = rtText.split("\n");
+                var rtNames = logParseHeader(rtLines[0]);
+                trackCtx = {
+                    lines: rtLines,
+                    pos: 1,
+                    lastT: -1,
+                    dayOffset: 0,
+                    trackCols: {
+                        posTime: rtNames.indexOf("gnss_posTime"),
+                        lat: rtNames.indexOf("gnss_lat"),
+                        lon: rtNames.indexOf("gnss_lon"),
+                        alt: rtNames.indexOf("gnss_alt"),
+                        gVel: rtNames.indexOf("gnss_gVel"),
+                    },
+                    samples: [],
+                    track: [],
+                    done: false,
+                };
+            } else {
+                trackCtx = null;
+                loadInfo = "No VESC Tool RT log next to this file, no map for this ride.";
+            }
+
+            parseCtx = {
+                lines: lines,
+                pos: 1,
+                lastT: -1,
+                dayOffset: 0,
+                colCount: names.length,
+                hasRt: trackCtx !== null,
+                rtPos: 0,
+                out: [],
+            };
+
+            initSeries(names.slice(1).concat(trackCtx !== null ? ["gnss_gVel"] : []), false);
+            parseTimer.start();
+        }
+
+        function parseChunk(maxLines) {
+            // phase 1: the RT log for the track, phase 2: the Refloat file -
+            // the GPS speed merge needs all RT samples up front
+            if (trackCtx !== null && !trackCtx.done) {
+                trackCtx.done = logParseTrackChunk(trackCtx, maxLines);
+                loadStatus = "loading: %1".arg(trackCtx.pos);
+                if (trackCtx.done) {
+                    track = trackCtx.track;
+                }
+                return;
+            }
+
+            var finished = logParseChunk(
+                parseCtx, trackCtx !== null ? trackCtx.samples : [], maxLines);
+            var out = parseCtx.out;
+            for (; fedSamples < out.length; fedSamples++) {
+                addSample(out[fedSamples], fedSamples);
+            }
+            loadStatus = "loading: %1".arg(sampleNr);
+
+            if (finished) {
+                finishLoad();
+            }
+        }
+
+        function finishLoad() {
+            parseTimer.stop();
+            // free the raw file content, only the parsed data is needed
+            parseCtx = null;
+            trackCtx = null;
+
+            if (sampleNr === 0 && track.length === 0) {
+                loadFailed = true;
+                loadStatus = "no data in log file";
+                return;
+            }
+
+            makeReady();
+            loadStatus = "";
+        }
+    }
+
     // A slider that changes position when tapped (Android slider requires a move)
     component TapSlider : Item {
         id: tapSlider
@@ -3385,8 +3977,24 @@ Item {
         property int toolbarOffset: 0
 
         property bool showRecordDownload: false
+        // shows the button opening the log view overlay (only on the live
+        // plot); deliberately independent of showRecordDownload - viewing log
+        // files needs neither data-record firmware nor a connected board
+        property bool showLogView: false
+        // vertical space at the top not used by the plot content, for the map
+        // in the log view overlay
+        property real contentTopMargin: 0
         property int maxWindowMinutes
         property bool dotsEnabled: true
+
+        // Exposed for the track map in the log view: the sample the cursor
+        // rests on, and the series selected in the plot menu. Deliberately
+        // plain properties synced by the internal objects, not aliases -
+        // change notifications of aliases into this inline component's
+        // internals did not reach outside bindings (the map cursor dot never
+        // moved); plain properties notify reliably.
+        property var cursorSample: null
+        property var selectedSeries: null
 
         function init(ticksPerSec) {
             ticksPerSecond = ticksPerSec;
@@ -3473,6 +4081,19 @@ Item {
 
                 onClicked: {
                     recordedPlot.show();
+                }
+            }
+
+            FloatingToolButton {
+                visible: plot.showLogView
+
+                // a document frame with a small curve inside
+                iconPath: Path {
+                    PathSvg {path: "M 11 10 L 39 10 L 39 40 L 11 40 L 11 10 M 16 33 L 23 24 L 28 28 L 34 17"}
+                }
+
+                onClicked: {
+                    logPlot.show();
                 }
             }
 
@@ -3592,6 +4213,10 @@ Item {
 
             property var selectedSeries: null
             property int selectedIndex: -1
+
+            // sync to the plain property the track map binds to
+            // (see the comment at plot.selectedSeries)
+            onSelectedSeriesChanged: plot.selectedSeries = selectedSeries
 
             function deselectSeries() {
                 selectedSeries = null;
@@ -3789,6 +4414,12 @@ Item {
 
         PinchArea {
             anchors.fill: parent
+            // leaves the map area of the log view free; 0 everywhere else
+            anchors.topMargin: plot.contentTopMargin
+            // hard boundary toward the map in the log view: nothing of the
+            // plot content may paint above contentTopMargin, also not
+            // transiently while the split handle is being dragged
+            clip: true
 
             property real initialPlotWindow
             property real initialX
@@ -3974,7 +4605,12 @@ Item {
                 onVisibleChanged: requestPaint();
                 onPositionChanged: requestPaint();
                 onWindowChanged: requestPaint();
-                onCursorChanged: requestPaint();
+                onCursorChanged: {
+                    requestPaint();
+                    // sync to the plain property the track map binds to
+                    // (see the comment at plot.cursorSample)
+                    plot.cursorSample = cursor;
+                }
                 onCursorOpacityChanged: requestPaint();
 
                 QtObject {
@@ -4800,10 +5436,686 @@ Item {
         CloseToolButton {
             anchors.top: parent.top
             anchors.left: parent.left
+            // like the plot toolbar, so it stays clickable above the log
+            // view's start page
+            z: parent.z + 5
 
             onClicked: {
                 parent.visible = false;
             }
+        }
+    }
+
+    component TrackMap : Item {
+        id: trackMap
+        // Mandatory: the tile Images are positioned by the view transform and
+        // the outermost ones stick out by up to a full tile (256px) past the
+        // map area. Items don't clip their children by default, so without
+        // this the tiles paint over the diagram below.
+        clip: true
+
+        // the loaded log (LogFilePlotData) providing track and series data
+        property var plotData
+        // the plot to couple the cursor with
+        property var plot
+
+        // Tile source: own proxy in front of Thunderforest, style "atlas",
+        // zoom up to 17 - a hard limit, the proxy doesn't answer above it;
+        // higher zoom upscales the existing tile level instead. The key is
+        // inserted from the file tile_api_key at build time; when loading
+        // refloatui.qml directly in VESC Tool the placeholder stays - see
+        // effectiveTileKey below.
+        readonly property string tileApiKey: "{{TILE_API_KEY}}"
+        readonly property string tileStyle: "atlas"
+        readonly property int tileMaxZoom: 17
+        // Android: VESC Tool's Qt build bundles no OpenSSL (no ANDROID_EXTRA_LIBS
+        // anywhere in vesc_tool), so every https request fails there - the map
+        // stayed black. The proxy serves plain http directly (no redirect), and
+        // VESC Tool itself fetches firmware/packages over http, too. iOS and
+        // desktop use the OS TLS stack and keep https.
+        readonly property string tileUrlBase: Qt.platform.os === "android"
+            ? "http://tiles.pev-point.de" : "https://tiles.pev-point.de"
+
+        // When loading the QML directly the placeholder is not replaced; then
+        // the key comes from the settings, so it never sits in the source
+        // (refloatui.qml gets transferred into the versioned ui.qml.in)
+        readonly property string effectiveTileKey: tileApiKey.indexOf("{{") === 0
+            ? preferences.devTileApiKey : tileApiKey
+
+        // View state, prepared for the tile layer (AP 5 of the log view
+        // plan): zoom is the web-mercator zoom level, the world is
+        // 256 * 2^zoom pixels wide. The tile layer attaches to exactly these
+        // three properties; pan/zoom gestures arrive together with it.
+        property real centerLat: 0
+        property real centerLon: 0
+        property real zoom: 1
+
+        readonly property var track: plotData ? plotData.track : []
+
+        // decimated draw list in normalized mercator coordinates:
+        // {x, y, t, v, color} entries with null marking gaps
+        property var drawList: []
+        // track with the gap markers removed, for time-based lookups
+        property var timeIndex: []
+
+        // the series the track is colored by, selected in the plot menu;
+        // without a selection GPS speed is used
+        readonly property var colorSeries: plot ? plot.selectedSeries : null
+
+        // the time of the sample the diagram cursor rests on
+        readonly property real cursorTime: plot && plot.cursorSample ? plot.cursorSample[0] : NaN
+
+        // shared view transform, also used by the tile Image delegates so
+        // tiles move with pan/zoom without a model rebuild
+        readonly property real worldSize: 256 * Math.pow(2, zoom)
+        readonly property real originX: width / 2 - project(centerLat, centerLon).x * worldSize
+        readonly property real originY: height / 2 - project(centerLat, centerLon).y * worldSize
+
+        // integer zoom level the tiles are loaded at; fractional zoom scales
+        // the tile images instead of loading a new level (see updateTileZ)
+        property int tileZ: 1
+        property var tileModel: []
+        property string tileModelKey: ""
+        property int tilesLoading: 0
+        // suppresses the draw list recomputation while a gesture is running
+        property bool gestureActive: false
+
+        // Zoom the track's bounding box fits at, set by fitTrack(). Doubles
+        // as the zoom-out limit (minus one level for surroundings): zooming
+        // further out than the whole recording plus context is pointless and
+        // would only pull world-level tiles.
+        property real fitZoom: 1
+        // true once the user panned/zoomed; suppresses the automatic re-fit
+        // on size changes so a rotation doesn't yank the view away
+        property bool userMoved: false
+
+        onTrackChanged: {
+            var idx = [];
+            for (var i = 0; i < track.length; i++) {
+                if (track[i] !== null) {
+                    idx.push(track[i]);
+                }
+            }
+            timeIndex = idx;
+
+            fitTrack();
+            rebuild();
+        }
+        // the draw list only depends on zoom (decimation threshold), not on
+        // the item size - a resize (e.g. dragging the split handle) only
+        // needs fresh tiles and a repaint, not the full recomputation
+        onWidthChanged: viewResized()
+        onHeightChanged: viewResized()
+
+        function viewResized() {
+            // keep the automatic whole-track fit until the user takes over
+            // the view; heals a fit computed with premature dimensions, too
+            if (!userMoved) {
+                fitTrack();
+            }
+            refreshView();
+        }
+        onColorSeriesChanged: rebuild()
+        onCursorTimeChanged: cursorCanvas.requestPaint()
+        onZoomChanged: {
+            updateTileZ();
+            if (gestureActive) {
+                refreshView();
+            } else {
+                rebuild();
+            }
+        }
+        onCenterLatChanged: refreshView()
+        onCenterLonChanged: refreshView()
+
+        // --- pure JS map projection, no QML references ---------------------
+        // Copied verbatim into a scratchpad test and run under node against
+        // known coordinates - keep identical and free of QML dependencies.
+
+        // normalized web mercator: (0,0) top left, (1,1) bottom right
+        function project(lat, lon) {
+            var s = Math.sin(lat * Math.PI / 180);
+            return {
+                x: (lon + 180) / 360,
+                y: 0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)
+            };
+        }
+
+        function unproject(x, y) {
+            return {
+                lat: Math.atan(Math.sinh(Math.PI * (1 - 2 * y))) * 180 / Math.PI,
+                lon: x * 360 - 180
+            };
+        }
+
+        // Tile indexes derive from the normalized projection: one zoom level
+        // splits the world into 2^z tiles per axis
+        function tileIndex(lat, lon, z) {
+            var n = Math.pow(2, z);
+            var p = project(lat, lon);
+            return { x: p.x * n, y: p.y * n };
+        }
+
+        // --- end of pure JS map projection ---------------------------------
+
+        // fits center and zoom to the track's bounding box, keeping the
+        // aspect ratio, with 5% margin on each side
+        function fitTrack() {
+            var minX = 1, maxX = 0, minY = 1, maxY = 0;
+            var idx = timeIndex;
+            if (idx.length === 0 || width <= 0 || height <= 0) {
+                return;
+            }
+
+            for (var i = 0; i < idx.length; i++) {
+                var p = project(idx[i].lat, idx[i].lon);
+                if (p.x < minX) { minX = p.x; }
+                if (p.x > maxX) { maxX = p.x; }
+                if (p.y < minY) { minY = p.y; }
+                if (p.y > maxY) { maxY = p.y; }
+            }
+
+            var c = unproject((minX + maxX) / 2, (minY + maxY) / 2);
+            centerLat = c.lat;
+            centerLon = c.lon;
+
+            var dx = Math.max(maxX - minX, 1e-9);
+            var dy = Math.max(maxY - minY, 1e-9);
+            fitZoom = clamp(Math.min(Math.log(width * 0.9 / (dx * 256)) / Math.LN2,
+                                     Math.log(height * 0.9 / (dy * 256)) / Math.LN2), 1, 20);
+            zoom = fitZoom;
+            userMoved = false;
+        }
+
+        function rebuild() {
+            buildDrawList();
+            refreshView();
+        }
+
+        function refreshView() {
+            refreshTiles();
+            mapCanvas.requestPaint();
+            cursorCanvas.requestPaint();
+        }
+
+        function updateTileZ() {
+            // hysteresis: only switch the tile level when the scale factor
+            // leaves [0.75, 1.5], so small zoom moves don't reload the grid
+            var f = Math.pow(2, zoom - tileZ);
+            if (f > 1.5 || f < 0.75) {
+                tileZ = clamp(Math.round(zoom), 0, tileMaxZoom);
+            }
+        }
+
+        function refreshTiles() {
+            if (!tileLayer.visible || width <= 0 || height <= 0) {
+                return;
+            }
+
+            var n = Math.pow(2, tileZ);
+            var x0 = clamp(Math.floor((0 - originX) / worldSize * n), 0, n - 1);
+            var x1 = clamp(Math.floor((width - originX) / worldSize * n), 0, n - 1);
+            var y0 = clamp(Math.floor((0 - originY) / worldSize * n), 0, n - 1);
+            var y1 = clamp(Math.floor((height - originY) / worldSize * n), 0, n - 1);
+
+            // exactly the visible range, no prefetching beyond the edge -
+            // every tile the proxy has never seen costs monthly budget
+            var key = tileZ + ":" + x0 + "-" + x1 + ":" + y0 + "-" + y1;
+            if (key === tileModelKey) {
+                return;
+            }
+            tileModelKey = key;
+
+            var tiles = [];
+            for (var ty = y0; ty <= y1; ty++) {
+                for (var tx = x0; tx <= x1; tx++) {
+                    tiles.push({x: tx, y: ty, z: tileZ});
+                }
+            }
+            tileModel = tiles;
+        }
+
+        function tileUrl(tile) {
+            return tileUrlBase + "/" + effectiveTileKey + "/" + tileStyle + "/"
+                + tile.z + "/" + tile.x + "/" + tile.y + ".png";
+        }
+
+        function panBy(dx, dy) {
+            userMoved = true;
+            var c = project(centerLat, centerLon);
+            var p = unproject(c.x - dx / worldSize, c.y - dy / worldSize);
+            centerLat = clamp(p.lat, -85.0511, 85.0511);
+            centerLon = clamp(p.lon, -180, 180);
+        }
+
+        // zoom while keeping the geo point under (px, py) fixed on screen;
+        // zooming out stops one level beyond the whole-track fit
+        function zoomAt(px, py, newZoom) {
+            userMoved = true;
+            var nx = (px - originX) / worldSize;
+            var ny = (py - originY) / worldSize;
+            zoom = clamp(newZoom, Math.max(1, fitZoom - 1), 20);
+            var ws = 256 * Math.pow(2, zoom);
+            var c = unproject(nx + (width / 2 - px) / ws,
+                              ny + (height / 2 - py) / ws);
+            centerLat = clamp(c.lat, -85.0511, 85.0511);
+            centerLon = clamp(c.lon, -180, 180);
+        }
+
+        // value of the given series at time t, from the time-sorted plot data
+        function seriesValueAt(t, series) {
+            var data = plotData ? plotData.data : [];
+            if (!series || data.length === 0) {
+                return undefined;
+            }
+
+            var lo = 0, hi = data.length - 1;
+            while (lo < hi) {
+                var mid = (lo + hi) >> 1;
+                if (data[mid][0] < t) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            return data[lo][series.dataOrder + 1];
+        }
+
+        // dark-to-bright ramp of the series color, so low and high values
+        // stay distinguishable on the line
+        function valueColor(base, f) {
+            f = clamp(f, 0, 1);
+            if (f < 0.5) {
+                return Qt.darker(base, 2.2 - 2.4 * f);
+            }
+            return Qt.lighter(base, 1 + (f - 0.5));
+        }
+
+        function buildDrawList() {
+            var trk = track;
+            if (trk.length === 0) {
+                drawList = [];
+                return;
+            }
+
+            var series = colorSeries;
+            var worldSize = 256 * Math.pow(2, zoom);
+            // decimate by distance (not every n-th point), so curves keep
+            // their shape while straights collapse; only applied to tracks
+            // over 5000 points
+            var decimate = trk.length > 5000;
+            var minDist = 3 / worldSize;
+            var minDist2 = minDist * minDist;
+
+            var pts = [];
+            var vMin = Infinity, vMax = -Infinity;
+            var lastX = 0, lastY = 0, havePrev = false;
+
+            for (var i = 0; i < trk.length; i++) {
+                var tp = trk[i];
+                if (tp === null) {
+                    if (pts.length > 0 && pts[pts.length - 1] !== null) {
+                        pts.push(null);
+                    }
+                    havePrev = false;
+                    continue;
+                }
+
+                var p = project(tp.lat, tp.lon);
+                if (decimate && havePrev && i < trk.length - 1) {
+                    var ddx = p.x - lastX;
+                    var ddy = p.y - lastY;
+                    if (ddx * ddx + ddy * ddy < minDist2) {
+                        continue;
+                    }
+                }
+                lastX = p.x;
+                lastY = p.y;
+                havePrev = true;
+
+                var v = series ? seriesValueAt(tp.t, series) : tp.gVel;
+                if (v === v && v !== undefined) {
+                    if (v < vMin) { vMin = v; }
+                    if (v > vMax) { vMax = v; }
+                }
+                pts.push({x: p.x, y: p.y, t: tp.t, v: v});
+            }
+
+            var range = vMax > vMin ? vMax - vMin : 1;
+            // GPS speed green when no series is selected
+            var baseColor = series ? series.color : "#3f9469";
+            for (var i = 0; i < pts.length; i++) {
+                var pt = pts[i];
+                if (pt !== null) {
+                    pt.color = pt.v === undefined || pt.v !== pt.v
+                        ? Qt.darker(baseColor, 1.6)
+                        : valueColor(baseColor, (pt.v - vMin) / range);
+                }
+            }
+
+            drawList = pts;
+        }
+
+        // nearest track point to time t, via binary search on the gap-free index
+        function trackPointAt(t) {
+            var idx = timeIndex;
+            if (idx.length === 0 || t !== t) {
+                return null;
+            }
+
+            var lo = 0, hi = idx.length - 1;
+            while (lo < hi) {
+                var mid = (lo + hi) >> 1;
+                if (idx[mid].t < t) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if (lo > 0 && dist(idx[lo - 1].t, t) < dist(idx[lo].t, t)) {
+                lo--;
+            }
+            return idx[lo];
+        }
+
+        function toScreen(p, ctxState) {
+            return {
+                x: p.x * ctxState.ws + ctxState.ox,
+                y: p.y * ctxState.ws + ctxState.oy
+            };
+        }
+
+        // snapshot of the shared view transform for a paint pass
+        function screenState() {
+            return { ws: worldSize, ox: originX, oy: originY };
+        }
+
+        Item {
+            id: tileLayer
+            anchors.fill: parent
+            visible: preferences.showMapTiles && trackMap.effectiveTileKey !== ""
+
+            onVisibleChanged: {
+                if (visible) {
+                    refreshTiles();
+                }
+            }
+
+            Repeater {
+                model: trackMap.tileModel
+
+                Image {
+                    // position/size derive from the shared view state, so the
+                    // tiles move with pan/zoom without a model rebuild
+                    x: modelData.x * (trackMap.worldSize / Math.pow(2, modelData.z)) + trackMap.originX
+                    y: modelData.y * (trackMap.worldSize / Math.pow(2, modelData.z)) + trackMap.originY
+                    width: trackMap.worldSize / Math.pow(2, modelData.z)
+                    height: width
+                    source: trackMap.tileUrl(modelData)
+                    asynchronous: true
+                    cache: true
+                    smooth: true
+
+                    // No retry logic: the proxy always answers 200 with a PNG
+                    // (missing tiles are empty transparent images). Errors
+                    // only happen without network/DNS, and a retry would just
+                    // re-trigger the proxy's upstream fetch.
+                    property bool counted: false
+                    function updateLoadCount() {
+                        var loading = status === Image.Loading;
+                        if (loading !== counted) {
+                            trackMap.tilesLoading += loading ? 1 : -1;
+                            counted = loading;
+                        }
+                    }
+                    onStatusChanged: updateLoadCount()
+                    Component.onCompleted: updateLoadCount()
+                    Component.onDestruction: {
+                        if (counted) {
+                            trackMap.tilesLoading--;
+                        }
+                    }
+                }
+            }
+        }
+
+        Canvas {
+            id: mapCanvas
+            anchors.fill: parent
+            contextType: "2d"
+
+            function paintScaleBar(ctx) {
+                // meters per pixel at the map center; the scale bar is the
+                // only size reference as long as there is no map background
+                var mPerPx = Math.cos(centerLat * Math.PI / 180) * 40075016.686
+                    / (256 * Math.pow(2, zoom));
+                var target = width * 0.25 * mPerPx;
+                var pow10 = Math.pow(10, Math.floor(Math.log(target) / Math.LN10));
+                var len = pow10;
+                if (target >= 5 * pow10) {
+                    len = 5 * pow10;
+                } else if (target >= 2 * pow10) {
+                    len = 2 * pow10;
+                }
+                var px = len / mPerPx;
+                var label = len >= 1000 ? (len / 1000) + " km" : len + " m";
+
+                var x = 12, y = height - 12;
+                ctx.strokeStyle = "#ffffff";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.moveTo(x, y - 5);
+                ctx.lineTo(x, y);
+                ctx.lineTo(x + px, y);
+                ctx.lineTo(x + px, y - 5);
+                ctx.stroke();
+                ctx.font = "12px sans-serif";
+                ctx.fillStyle = "#ffffff";
+                ctx.fillText(label, x + px / 2 - ctx.measureText(label).width / 2, y - 6);
+            }
+
+            onPaint: {
+                var ctx = getContext("2d");
+                ctx.clearRect(0, 0, width, height);
+
+                var list = drawList;
+                if (list.length === 0) {
+                    return;
+                }
+
+                var st = screenState();
+                ctx.lineWidth = 3;
+                ctx.lineCap = "round";
+
+                // per-segment stroke because every segment has its own color;
+                // null entries break the line instead of connecting across gaps
+                var prev = null;
+                for (var i = 0; i < list.length; i++) {
+                    var pt = list[i];
+                    if (pt === null) {
+                        prev = null;
+                        continue;
+                    }
+                    var s = toScreen(pt, st);
+                    if (prev !== null) {
+                        ctx.strokeStyle = pt.color;
+                        ctx.beginPath();
+                        ctx.moveTo(prev.x, prev.y);
+                        ctx.lineTo(s.x, s.y);
+                        ctx.stroke();
+                    }
+                    prev = s;
+                }
+
+                // start (green) and end (red) marks
+                var first = null, last = null;
+                for (var i = 0; i < list.length; i++) {
+                    if (list[i] !== null) {
+                        if (first === null) { first = list[i]; }
+                        last = list[i];
+                    }
+                }
+                var marks = [[first, "#2eb04c"], [last, "#d33a2c"]];
+                for (var i = 0; i < marks.length; i++) {
+                    var m = toScreen(marks[i][0], st);
+                    ctx.fillStyle = marks[i][1];
+                    ctx.strokeStyle = "#ffffff";
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(m.x, m.y, 5, 0, 2 * Math.PI);
+                    ctx.fill();
+                    ctx.stroke();
+                }
+
+                paintScaleBar(ctx);
+            }
+        }
+
+        // the cursor dot lives on its own canvas so following the diagram
+        // cursor doesn't redraw the whole track
+        Canvas {
+            id: cursorCanvas
+            anchors.fill: parent
+            contextType: "2d"
+
+            onPaint: {
+                var ctx = getContext("2d");
+                ctx.clearRect(0, 0, width, height);
+
+                var tp = trackPointAt(cursorTime);
+                if (tp === null) {
+                    return;
+                }
+
+                var s = toScreen(project(tp.lat, tp.lon), screenState());
+                ctx.strokeStyle = "#ffffff";
+                ctx.fillStyle = "#40ffffff";
+                ctx.lineWidth = 2;
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, 7, 0, 2 * Math.PI);
+                ctx.fill();
+                ctx.stroke();
+            }
+        }
+
+        PinchArea {
+            anchors.fill: parent
+
+            property real initialZoom
+
+            onPinchStarted: {
+                trackMap.gestureActive = true;
+                initialZoom = trackMap.zoom;
+            }
+
+            onPinchUpdated: {
+                trackMap.zoomAt(pinch.center.x, pinch.center.y,
+                                initialZoom + Math.log(pinch.scale) / Math.LN2);
+                trackMap.panBy(pinch.center.x - pinch.previousCenter.x,
+                               pinch.center.y - pinch.previousCenter.y);
+            }
+
+            onPinchFinished: {
+                trackMap.gestureActive = false;
+                // the draw list recomputation was suppressed during the
+                // gesture; catch up now
+                trackMap.rebuild();
+            }
+
+            MouseArea {
+                anchors.fill: parent
+
+                property real lastX
+                property real lastY
+                property bool dragged: false
+
+                onPressed: {
+                    lastX = mouse.x;
+                    lastY = mouse.y;
+                    dragged = false;
+                }
+
+                onPositionChanged: {
+                    var dx = mouse.x - lastX;
+                    var dy = mouse.y - lastY;
+                    // ignore small jitter so a tap stays a tap
+                    if (!dragged && dx * dx + dy * dy < 100) {
+                        return;
+                    }
+                    dragged = true;
+                    trackMap.panBy(dx, dy);
+                    lastX = mouse.x;
+                    lastY = mouse.y;
+                }
+
+                onWheel: {
+                    trackMap.zoomAt(wheel.x, wheel.y,
+                                    trackMap.zoom + wheel.angleDelta.y / 480);
+                }
+
+                onDoubleClicked: {
+                    // reset the view to the track's bounding box
+                    trackMap.fitTrack();
+                    trackMap.rebuild();
+                }
+
+                // tap on the track: spawn the diagram cursor at the nearest point
+                onClicked: {
+                    if (dragged) {
+                        return;
+                    }
+
+                    var list = drawList;
+                    var st = screenState();
+                    var best = null;
+                    var bestDist = 30 * 30;
+                    for (var i = 0; i < list.length; i++) {
+                        if (list[i] === null) {
+                            continue;
+                        }
+                        var s = toScreen(list[i], st);
+                        var dx = s.x - mouse.x;
+                        var dy = s.y - mouse.y;
+                        var d = dx * dx + dy * dy;
+                        if (d < bestDist) {
+                            bestDist = d;
+                            best = list[i];
+                        }
+                    }
+                    if (best !== null && plot) {
+                        plot.spawnCursor(best.t);
+                    }
+                }
+            }
+        }
+
+        // quiet hint while tiles load: the first visit of a region makes the
+        // proxy fetch upstream, which may take a while and is expected
+        DText {
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.margins: 4
+            visible: trackMap.tilesLoading > 0
+            font.pixelSize: 10
+            text: "loading map…"
+        }
+
+        // Attribution is mandatory as long as tiles are shown, with working
+        // links (Thunderforest requirement); declared after the input areas
+        // so the links stay clickable
+        Text {
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.margins: 4
+            visible: tileLayer.visible
+            font.pixelSize: 10
+            color: "#eeeeee"
+            style: Text.Outline
+            styleColor: "#aa000000"
+            textFormat: Text.StyledText
+            linkColor: "#9dc0ec"
+            text: "Maps © <a href=\"https://www.thunderforest.com\">Thunderforest</a>, Data © <a href=\"https://www.openstreetmap.org/copyright\">OpenStreetMap contributors</a>"
+            onLinkActivated: Qt.openUrlExternally(link)
         }
     }
 
@@ -5042,6 +6354,35 @@ Item {
 
         onRejected: {
             applyConfigDialog.close();
+        }
+    }
+
+    Dl.FileDialog {
+        id: logLoadDialog
+        title: "Choose a log file to load"
+        // no "*.csv": VESC Tool's own RT logs sit in the same directory and
+        // can't be loaded here, beginParse() rejects them by their header
+        nameFilters: ["Refloat logs (*_refloat.csv)"]
+        selectExisting: true
+
+        function show() {
+            if (!Utility.requestFilePermission()) {
+                VescIf.emitMessageDialog(
+                            "File Permissions",
+                            "Unable to request file system permission.",
+                            false, false);
+                return;
+            }
+
+            var dir = logRecorder.logDirUrl();
+            if (dir !== "") {
+                folder = dir;
+            }
+            open();
+        }
+
+        onAccepted: {
+            logPlot.loadFile(fileUrl.toString());
         }
     }
 
@@ -5462,6 +6803,38 @@ Item {
                             maxValue: 1000
                             onValueChanged: {
                                 preferences.plotMaxWindowMinutes = value
+                            }
+                        }
+
+                        RightSwitch {
+                            id: prefShowMapTiles
+                            checked: true
+                            label: "Show map tiles in log view"
+                        }
+
+                        OptionDescription {
+                            text: "Disable to keep the GPS track without downloading map tiles, e.g. to save mobile data."
+                        }
+
+                        // Development only: tile key input, visible only while
+                        // the {{TILE_API_KEY}} placeholder is unreplaced -
+                        // the released package has the key baked in at build
+                        // time and never shows this field
+                        RowLayout {
+                            Layout.fillWidth: true
+                            visible: "{{TILE_API_KEY}}".indexOf("{{") === 0
+
+                            LText {
+                                text: "Map tile API key (dev)"
+                            }
+
+                            TextField {
+                                Layout.fillWidth: true
+                                text: preferences.devTileApiKey
+
+                                onEditingFinished: {
+                                    preferences.devTileApiKey = text;
+                                }
                             }
                         }
 
@@ -7125,6 +8498,361 @@ Item {
         }
     }
 
+    OverlayPlot {
+        id: logPlot
+
+        // a whole log should be viewable in one window, unlike the live plot
+        maxWindowMinutes: 24 * 60
+        // the data-record buttons of the live plot don't belong here
+        showRecordDownload: false
+
+        // ratio of the map to the whole height, adjustable via the drag
+        // handle between map and diagram
+        property real splitRatio: 0.4
+
+        // bottom edge of the handle; mapArea.height alone would miss its top
+        // offset below the toolbar and let the diagram start inside the map
+        contentTopMargin: mapArea.visible ? splitHandle.y + splitHandle.height : 0
+
+        plotData: LogFilePlotData {
+            id: logPlotData
+            seriesMetaData: plotSeriesMetaData
+            seriesExtraColors: plotSeriesExtraColors
+
+            onDataReadyChanged: {
+                if (dataReady) {
+                    logPlot.storeLogMeta();
+                }
+            }
+        }
+
+        // cached per-file metadata (duration, distance, position) keyed by
+        // file name, so the log list doesn't have to read every file
+        property Settings logMetaStorage: Settings {
+            id: logMetaStorage
+            category: "logs"
+
+            property var logMeta: ({})
+        }
+
+        function storeLogMeta() {
+            var trk = logPlotData.track;
+            var distM = 0;
+            var prev = null;
+            for (var i = 0; i < trk.length; i++) {
+                var tp = trk[i];
+                if (tp === null) {
+                    prev = null;
+                    continue;
+                }
+                if (prev !== null) {
+                    // equirectangular approximation, plenty for a ride distance
+                    var dx = (tp.lon - prev.lon) * 111320 * Math.cos(tp.lat * Math.PI / 180);
+                    var dy = (tp.lat - prev.lat) * 110540;
+                    distM += Math.sqrt(dx * dx + dy * dy);
+                }
+                prev = tp;
+            }
+
+            var meta = logMetaStorage.logMeta || {};
+            meta[logPlotData.fileName] = {
+                duration: Math.round(logPlotData.timeRange / 1000),
+                distance: Math.round(distM),
+                pos: trk.length > 0,
+            };
+            // full assignment (not in-place mutation) so Qt.labs.settings
+            // persists the value and the list bindings recompute
+            logMetaStorage.logMeta = meta;
+        }
+
+        function show() {
+            if (!Utility.requestFilePermission()) {
+                VescIf.emitMessageDialog(
+                            "File Permissions",
+                            "Unable to request file system permission.",
+                            false, false);
+                return;
+            }
+
+            // the start page with the existing recordings shows automatically
+            // while nothing is loaded (see logList)
+            visible = true;
+        }
+
+        function loadFile(fileUrl) {
+            // The file currently being recorded is still growing (appended
+            // every 100 samples) - loading that snapshot would cache wrong
+            // metadata for it. It appears in the list, so guard here centrally.
+            if (logRecorder.recording && logRecorder.filePath !== ""
+                    && fileUrl.indexOf(logRecorder.filePath) !== -1) {
+                VescIf.emitStatusMessage("This log is still being recorded", false);
+                return;
+            }
+
+            init(1000);
+            logPlotData.load(fileUrl);
+            visible = true;
+        }
+
+        // continues the toolbar after the close button and the plot's own
+        // menu button
+        Row {
+            id: logToolbar
+            anchors.left: parent.left
+            anchors.top: parent.top
+            anchors.leftMargin: 2 * (toolButtonSize + spacing) + spacing
+            anchors.topMargin: spacing
+            spacing: toolButtonSize / 10
+            z: parent.z + 5
+
+            FloatingToolButton {
+                // folder icon: open a log file
+                iconPath: Path {
+                    PathSvg {path: "M 9 15 L 20 15 L 24 19 L 41 19 L 41 38 L 9 38 L 9 15"}
+                }
+
+                onClicked: {
+                    // With a log loaded (or a load pending/failed) the list
+                    // page is hidden and there was no way back to it; the
+                    // first click returns to the list, from there the button
+                    // opens the file dialog (desktop - dead on Android).
+                    if (logPlotData.dataReady || logPlotData.loadStatus !== "") {
+                        logPlotData.unload();
+                    } else {
+                        logLoadDialog.show();
+                    }
+                }
+            }
+
+            ToggleFloatingToolButton {
+                autonomous: false
+                value: logRecorder.recording
+
+                customBgColor: value ? Utility.getAppHexColor("red") : Utility.getAppHexColor("normalBackground")
+                fillColor: value ? Utility.getAppHexColor("normalText") : Utility.getAppHexColor("red")
+
+                trueFillIconPath: Path {
+                    PathSvg {path: "M 13 13 L 13 37 L 37 37 L 37 13 L 13 13"}
+                }
+
+                falseFillIconPath: Path {
+                    PathAngleArc {centerX: 25; centerY: 25; radiusX: 12; radiusY: 12; sweepAngle: 360;}
+                }
+
+                onClicked: {
+                    if (logRecorder.recording) {
+                        logRecorder.stop();
+                    } else {
+                        logRecorder.start();
+                    }
+                }
+            }
+        }
+
+        // header: recording status while recording, otherwise the loaded file
+        NText {
+            anchors.left: logToolbar.right
+            anchors.right: parent.right
+            anchors.verticalCenter: logToolbar.verticalCenter
+            anchors.leftMargin: toolButtonSize / 2
+            anchors.rightMargin: toolButtonSize / 2
+            font.pixelSize: fontSizeSuperSmall
+            elide: Text.ElideRight
+            maximumLineCount: 2
+            wrapMode: Text.Wrap
+            z: logToolbar.z
+
+            text: {
+                if (logRecorder.recording) {
+                    // sampleCount updating at 10Hz also drives the elapsed time
+                    var secs = Math.max(0, Math.round((logRecorder.utcMsToday() - logRecorder.startTime) / 1000));
+                    return "REC %1:%2 · %3 samples"
+                        .arg(Math.floor(secs / 60)).arg(("0" + secs % 60).slice(-2))
+                        .arg(logRecorder.sampleCount);
+                }
+                if (!logPlotData.dataReady) {
+                    return "";
+                }
+                var dur = Math.round(logPlotData.timeRange / 1000);
+                var text = "%1 · %2:%3 · %4 samples".arg(logPlotData.fileName)
+                    .arg(Math.floor(dur / 60)).arg(("0" + dur % 60).slice(-2))
+                    .arg(logPlotData.sampleNr);
+                if (logPlotData.loadInfo !== "") {
+                    text += "\n" + logPlotData.loadInfo;
+                } else if (logPlotData.track.length === 0) {
+                    // the map stays hidden then; say why instead of showing
+                    // an empty area
+                    text += "\nNo position data in this log.";
+                }
+                return text;
+            }
+        }
+
+        // map on top of the diagram; gets the TrackMap as content (AP 4)
+        Item {
+            id: mapArea
+            anchors.top: parent.top
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.topMargin: logToolbar.height + logToolbar.anchors.topMargin
+            height: (parent.height - anchors.topMargin) * logPlot.splitRatio
+            visible: logPlotData.dataReady && logPlotData.track.length > 0
+
+            TrackMap {
+                id: trackMapView
+                anchors.fill: parent
+                plotData: logPlotData
+                plot: logPlot
+            }
+        }
+
+        Rectangle {
+            id: splitHandle
+            anchors.top: mapArea.bottom
+            anchors.left: parent.left
+            anchors.right: parent.right
+            height: 10
+            visible: mapArea.visible
+            // above the map, whose own pan gesture would otherwise receive
+            // the press in the overlapping touch margin
+            z: mapArea.z + 1
+            color: getDarkThemeColor("darkBackground")
+
+            Rectangle {
+                anchors.centerIn: parent
+                width: 40
+                height: 4
+                radius: 2
+                color: Utility.getAppHexColor("disabledText")
+            }
+
+            MouseArea {
+                // taller than the visible handle for a usable touch target
+                anchors.fill: parent
+                anchors.topMargin: -10
+                anchors.bottomMargin: -10
+                // Without this the surrounding gesture handlers take the drag
+                // away as soon as the finger moves: the map pans below, the
+                // plot scrolls its time axis - the handle itself stays put.
+                preventStealing: true
+
+                onPositionChanged: {
+                    if (pressed) {
+                        var y = mapToItem(logPlot, mouse.x, mouse.y).y - mapArea.anchors.topMargin;
+                        logPlot.splitRatio = clamp(y / (logPlot.height - mapArea.anchors.topMargin), 0.15, 0.75);
+                    }
+                }
+            }
+        }
+
+        Text {
+            anchors.centerIn: parent
+            visible: !logPlotData.dataReady && logPlotData.loadStatus !== ""
+
+            color: logPlotData.loadFailed ? Utility.getAppHexColor("red") : getDarkThemeColor("lightText")
+            font.pixelSize: fontSizeNormal
+            horizontalAlignment: Text.AlignHCenter
+            text: logPlotData.loadStatus
+        }
+
+        // start page: the existing recordings instead of a bare file dialog;
+        // the file dialog stays available via the folder toolbar button
+        Rectangle {
+            id: logList
+            anchors.fill: parent
+            // above the plot content and input, below toolbar and menu
+            z: parent.z + 3
+            color: logPlot.color
+            visible: logPlot.visible && !logPlotData.dataReady && logPlotData.loadStatus === ""
+
+            FolderListModel {
+                id: logFolderModel
+                folder: logRecorder.logDirUrl()
+                nameFilters: ["*_refloat.csv"]
+                showDirs: false
+                // the timestamp in the file name sorts by date: newest first
+                sortField: FolderListModel.Name
+                sortReversed: true
+            }
+
+            // "2026-08-19_18-22-04_refloat.csv" -> "2026-08-19 18:22:04"
+            function displayName(name) {
+                var m = name.match(/^(\d{4}-\d{2}-\d{2})_(\d{2})-(\d{2})-(\d{2})/);
+                return m ? m[1] + " " + m[2] + ":" + m[3] + ":" + m[4] : name;
+            }
+
+            function metaLine(name) {
+                var meta = (logMetaStorage.logMeta || {})[name];
+                if (!meta) {
+                    return "not opened yet";
+                }
+                var line = "%1:%2".arg(Math.floor(meta.duration / 60))
+                    .arg(("0" + meta.duration % 60).slice(-2));
+                if (meta.pos) {
+                    line += " · %1 km · GPS".arg((meta.distance / 1000).toFixed(1));
+                }
+                return line;
+            }
+
+            ListView {
+                anchors.fill: parent
+                anchors.margins: 10
+                anchors.topMargin: logToolbar.height + 2 * logToolbar.anchors.topMargin
+                clip: true
+                model: logFolderModel
+
+                delegate: Item {
+                    width: ListView.view.width
+                    height: 48
+
+                    NText {
+                        anchors.left: parent.left
+                        anchors.top: parent.top
+                        anchors.topMargin: 4
+                        text: logList.displayName(fileName)
+                    }
+
+                    DText {
+                        anchors.left: parent.left
+                        anchors.bottom: parent.bottom
+                        anchors.bottomMargin: 4
+                        font.pixelSize: fontSizeSuperSmall
+                        text: logList.metaLine(fileName)
+                    }
+
+                    Rectangle {
+                        anchors.bottom: parent.bottom
+                        width: parent.width
+                        height: 1
+                        color: getDarkThemeColor("darkBackground")
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+
+                        onClicked: {
+                            logPlot.loadFile(fileURL.toString());
+                        }
+                    }
+                }
+            }
+
+            DText {
+                anchors.centerIn: parent
+                width: parent.width * 0.8
+                visible: logFolderModel.count === 0
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.Wrap
+                // naming the directory makes a wrong or empty path obvious
+                // instead of looking like "no recordings yet"
+                text: logRecorder.vescToolSettings.path_rt_log === ""
+                    ? "No log directory set yet. Start a recording with the record button to choose one."
+                    : "No recordings found in\n%1\n\nStart a recording with the record button. The directory is the one VESC Tool uses for RT logging."
+                        .arg(logRecorder.logPathOf(logRecorder.logDirUrl()))
+            }
+        }
+    }
+
     Popup {
         id: remoteOverlay
         parent: mainItem
@@ -8737,6 +10465,7 @@ Item {
                     maxWindowMinutes: preferences.plotMaxWindowMinutes
 
                     showRecordDownload: state.capDataRecord
+                    showLogView: true
 
                     plotData: PlotData {
                         id: rtPlotData

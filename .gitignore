@@ -1,5 +1,6 @@
 compile_commands.json
 package_README-gen.md
+tile_api_key
 ui.qml
 
 *.bin
