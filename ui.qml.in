@@ -7342,6 +7342,16 @@ Item {
                     property bool loaded: false
                     property var hermesTunes: []
 
+                    // Hermes answers over https only, and Android has no TLS
+                    // (see TrackMap.tileUrlBase). There the requests take the
+                    // same proxy as the map tiles, which mirrors /tunes and
+                    // /tunes/<id>/download over http below the same key - so
+                    // host and key stay defined in exactly one place.
+                    readonly property string hermesUrlBase:
+                        Qt.platform.os === "android" && trackMapView && trackMapView.effectiveTileKey !== ""
+                            ? "%1/%2/hermes".arg(trackMapView.tileUrlBase).arg(trackMapView.effectiveTileKey)
+                            : "https://ridehermes.app"
+
                     onVisibleChanged: {
                         if (visible) {
                             ensureLoaded();
@@ -7368,7 +7378,7 @@ Item {
                     function download() {
                         hermesArchiveStatus.text = "Downloading tunes...";
                         var http = new XMLHttpRequest();
-                        http.open("GET", "https://ridehermes.app/tunes", true);
+                        http.open("GET", hermesUrlBase + "/tunes", true);
                         http.onreadystatechange = function() {
                             if (http.readyState === XMLHttpRequest.DONE) {
                                 if (http.status === 200) {
@@ -7378,10 +7388,15 @@ Item {
                                         tuneManager.saveHermesArchive(listing);
                                         hermesTunes = listing;
                                     } else {
-                                        hermesArchiveStatus.text = "Failed to parse the tune listing, the site may have changed.";
+                                        // the received size distinguishes an
+                                        // empty/truncated response from HTML
+                                        // the parser genuinely cannot read
+                                        hermesArchiveStatus.text =
+                                            "Failed to parse the tune listing (%1 bytes received), the site may have changed."
+                                            .arg(http.responseText.length);
                                     }
                                 } else if (http.status === 0) {
-                                    hermesArchiveStatus.text = "Download failed: Connection error";
+                                    hermesArchiveStatus.text = hermesConnectionError();
                                 } else {
                                     hermesArchiveStatus.text = "Download failed: %1 - %2".arg(http.status).arg(http.statusText);
                                 }
@@ -7389,6 +7404,22 @@ Item {
                         };
 
                         http.send();
+                    }
+
+                    // Status 0 means the request never reached the server, and
+                    // on Android that has its own cause: VESC Tool's build
+                    // there ships no OpenSSL, so every https request fails
+                    // (proven with the map tiles, which only appeared after
+                    // switching them to http). Naming it beats a bare
+                    // "Connection error", which sent us hunting certificates.
+                    function hermesConnectionError() {
+                        if (Qt.platform.os === "android") {
+                            return hermesUrlBase.indexOf("https:") === 0
+                                ? "Download failed: this Android build has no HTTPS support. "
+                                    + "Without a tile key the download cannot use the proxy either."
+                                : "Download failed: the tune proxy did not answer (or no network).";
+                        }
+                        return "Download failed: Connection error";
                     }
 
                     function fetchTune(entry, callback) {
@@ -7400,7 +7431,7 @@ Item {
 
                         hermesArchiveStatus.text = "Downloading \"%1\"...".arg(entry.name);
                         var http = new XMLHttpRequest();
-                        http.open("GET", "https://ridehermes.app/tunes/%1/download".arg(entry.id), true);
+                        http.open("GET", "%1/tunes/%2/download".arg(hermesUrlBase).arg(entry.id), true);
                         http.onreadystatechange = function() {
                             if (http.readyState === XMLHttpRequest.DONE) {
                                 if (http.status === 200) {
@@ -7413,7 +7444,7 @@ Item {
                                         hermesArchiveStatus.text = "Failed to parse tune \"%1\"".arg(entry.name);
                                     }
                                 } else if (http.status === 0) {
-                                    hermesArchiveStatus.text = "Download failed: Connection error";
+                                    hermesArchiveStatus.text = hermesConnectionError();
                                 } else {
                                     hermesArchiveStatus.text = "Download failed: %1 - %2".arg(http.status).arg(http.statusText);
                                 }
