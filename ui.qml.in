@@ -1047,6 +1047,13 @@ Item {
         // and others, not these two). A *signal argument* of the same type
         // does work, which is how the setup values below arrive. The track
         // therefore still comes from VESC Tool's own CSV, see LogFilePlotData.
+        //
+        // Refloat itself can report GNSS too, via COMMAND_REALTIME_DATA's
+        // mask2 (doc/commands/REALTIME_DATA.md, not the internal command 31/32
+        // used above for the live channels). But that reads VESC_IF->mc_gnss(),
+        // firmware-side state fed by a GNSS module wired to the VESC - not the
+        // phone. Most boards don't have one, so the phone's GPS via VESC
+        // Tool's RT log stays the general-purpose source.
         readonly property var setupColumnNames: [
             "battery_level", "amp_hours_setup", "watt_hours_setup", "tacho_meters",
         ]
