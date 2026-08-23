@@ -17,8 +17,12 @@
 // this program. If not, see <http://www.gnu.org/licenses/>.
 
 import Qt.labs.settings 1.0
-// in the deployment because VESC Tool's own file pickers use it
+// Both of these are in the deployment because VESC Tool's own file pickers
+// use them (mobile/FilePicker.qml, mobile/DirectoryPicker.qml, LogBox.qml).
+// Qt.labs.platform has to stay aliased: its Menu/MenuItem would otherwise
+// shadow the ones from QtQuick.Controls that tunesFabMenu is built from.
 import Qt.labs.folderlistmodel 2.1
+import Qt.labs.platform 1.1 as Platform
 import QtQuick 2.15
 import QtQuick.Controls 2.15
 import QtQuick.Layouts 1.15
@@ -511,8 +515,11 @@ Item {
         // getParamType() is null in precisely the places where getParamValue()
         // is - the ::sep:: entries of the grouping - so the two agree.
         // Doubles are quantised onto the grid the editor can display, one
-        // decimal finer, which is what keeps a share code down to a 61x61 QR
-        // symbol; fixed width floats would need 93x93.
+        // decimal finer, which is what keeps a share code small enough to
+        // scan: measured against the current parameter set a full tune is a
+        // 61x61 symbol with a short name and a 65x65 one with the longest
+        // name the dialog allows, where fixed width floats would not even fit
+        // the version 20 this encoder stops at.
         function tuneSchema() {
             if (!checkConfig()) return null;
 
@@ -1009,6 +1016,35 @@ Item {
         property var packageUpdateSnooze
     }
 
+    // Everything about our tile proxy in one place: the map tiles, the Hermes
+    // archive (which is routed through the same host on Android) and the
+    // development key field in the settings all read from here, so host and
+    // key are defined once and cannot drift apart.
+    QtObject {
+        id: tileProxy
+
+        // Android: VESC Tool's Qt build there bundles no OpenSSL (no
+        // ANDROID_EXTRA_LIBS anywhere in vesc_tool), so every https request
+        // fails - the map stayed black. The proxy serves plain http directly
+        // (no redirect), and VESC Tool itself fetches firmware and packages
+        // over http, too. iOS and desktop use the OS TLS stack and keep https.
+        readonly property string urlBase: Qt.platform.os === "android"
+            ? "http://tiles.pev-point.de" : "https://tiles.pev-point.de"
+
+        // Inserted from the file tile_api_key at build time.
+        readonly property string apiKey: "{{TILE_API_KEY}}"
+
+        // True while the build time substitution has not happened, i.e. when
+        // refloatui.qml is loaded directly in VESC Tool. Only then does the
+        // settings dialog offer a key field, so the key never sits in the
+        // source that gets transferred into the versioned ui.qml.in.
+        readonly property bool placeholder: apiKey.indexOf("{{") === 0
+
+        // Empty when neither route yields a key - the map hides its tile layer
+        // and Hermes falls back to talking to the site directly.
+        readonly property string key: placeholder ? preferences.devTileApiKey : apiKey
+    }
+
     QtObject {
         id: updateChecker
 
@@ -1137,7 +1173,15 @@ Item {
             // no category: reads the same key as the RT log box of VESC Tool,
             // so that Refloat doesn't introduce a second log directory
             id: vescToolSettings
-            property string path_rt_log: ""
+            // Same default as VESC Tool's own log box
+            // (mobile/LogBox.qml: rtLogFileText.text), so that a phone which
+            // has never had that box open still has a directory here. Without
+            // it start() fell through to logDirDialog, and that is a
+            // Dl.FileDialog - dead on Android. openRtLogFile() creates the
+            // directory itself (vescinterface.cpp: QDir().mkpath).
+            property string path_rt_log:
+                Platform.StandardPaths.writableLocation(Platform.StandardPaths.DocumentsLocation)
+                + "/logs"
         }
 
         property var logDirDialog: Dl.FileDialog {
@@ -1178,8 +1222,10 @@ Item {
         }
 
         function buildColumns() {
-            // The header is written once in start(). A reconnect re-runs this,
-            // and a different channel set would misalign every following row.
+            // The header is written once in start(), so the column set must
+            // not move under it. A reconnect re-runs this; keeping the old
+            // names is only half the job, addSample() pads and truncates every
+            // row to this length so the file stays aligned either way.
             if (recording) {
                 return;
             }
@@ -1259,6 +1305,20 @@ Item {
 
             var dir = vescToolSettings.path_rt_log;
             if (dir === "") {
+                // The property has a default, so this only happens once the
+                // key has been cleared - VESC Tool's own log box writes it
+                // through whenever its text field is emptied.
+                if (Qt.platform.os === "android") {
+                    // Dl.FileDialog does nothing on Android (VESC Tool
+                    // commented its own FolderDialog out for the same reason),
+                    // so point at the box that owns this setting instead of
+                    // opening a dialog that never comes back.
+                    VescIf.emitMessageDialog("Refloat Logging",
+                                             "No log directory is set. Please choose one in VESC Tool "
+                                             + "under RT logging first.",
+                                             false, false);
+                    return;
+                }
                 // start() is called again from the dialog once a directory is set
                 logDirDialog.open();
                 return;
@@ -1323,8 +1383,14 @@ Item {
             }
 
             var fields = [utcMsToday(), sample[1], sample[2], sample[3], sample[4]];
-            for (var i = 5; i < sample.length; i++) {
-                fields.push(csvNum(sample[i]));
+            // Driven by the header, not by the sample: a reconnect to a board
+            // with a different channel set changes the sample length while
+            // buildColumns() keeps the header, and every row after that would
+            // sit under the wrong names. Missing values stay empty, extra ones
+            // are dropped.
+            for (var i = 0; i < columnNames.length; i++) {
+                var value = sample[i + 5];
+                fields.push(value === undefined ? "" : csvNum(value));
             }
 
             var setup = setupValues;
@@ -1766,13 +1832,22 @@ Item {
             if (!tune) {
                 return false;
             }
+            // Both halves of boardKey() can be empty - getConnectedUuid()
+            // returns "" while disconnected (vescinterface.cpp) and
+            // getLastBleAddr() is empty until the first BLE connection. An
+            // empty key is not an identity: it would match every other board
+            // without one, so nothing counts as pinned here.
+            var key = boardKey();
+            if (!key) {
+                return false;
+            }
             if (tune.boards) {
-                return tune.boards.indexOf(boardKey()) >= 0;
+                return tune.boards.indexOf(key) >= 0;
             }
             // beta leftover from when a tune belonged to a single board; can go
             // once no stored tune carries board.pinned any more
             return !!(tune.board && tune.board.pinned
-                && (tune.board.uuid ? tune.board.uuid === boardKey()
+                && (tune.board.uuid ? tune.board.uuid === key
                                     : tune.board.id === board.getId()));
         }
 
@@ -2040,6 +2115,20 @@ Item {
         // One-time migration of the legacy tune_slot_N storage into myTunes.
         // The slot keys are kept so downgrading the package remains possible.
         function migrateTuneSlots() {
+            // A filled myTunes means the flag was lost, not that the migration
+            // was missed - running it again would overwrite every tune saved
+            // since with whatever the old slots still hold.
+            var existing = tuneStorage.myTunes;
+            if (existing) {
+                if (typeof existing === "string") {
+                    existing = JSON.parse(existing);
+                }
+                if (existing.length > 0) {
+                    tuneStorage.tuneSlotsMigrated = true;
+                    return;
+                }
+            }
+
             var migrated = [];
             for (var slot = 1; slot <= maxTunes; slot++) {
                 var tune = loadTune(slot);
@@ -2138,6 +2227,14 @@ Item {
             var tunes = myTunes;
             tunes.splice(index, 1);
             saveMyTunes(tunes);
+            // The header would otherwise keep naming a tune that is gone, and
+            // loadCurrentTune() would bring it back from its stored copy on the
+            // next start - that fallback exists for tunes applied straight from
+            // an archive, not for deleted ones.
+            if (currentTune && currentTune.uuid === uuid) {
+                tuneStorage.setValue(currentTuneKey(), "");
+                currentTune = null;
+            }
         }
 
         function setFavorite(uuid, favorite) {
@@ -2523,11 +2620,14 @@ Item {
         //   name (UTF-8) | presence bitmask (one bit per schema entry) |
         //   bit packed values of the present entries | CRC-16 (2)
         // The values are quantised onto the grid the editor can display, one
-        // decimal finer, which is what keeps the code small enough to scan:
-        // fixed width floats would need a 93x93 symbol instead of 61x61.
-        // The signature covers every schema property the layout depends on, so
-        // a code from a package whose parameters differ is rejected outright
-        // rather than decoded into plausible looking nonsense.
+        // decimal finer, which is what keeps the code small enough to scan: a
+        // full tune is a 61x61 symbol with a short name and a 65x65 one with
+        // the longest name allowed, where fixed width floats would not fit the
+        // version 20 this encoder stops at.
+        // The signature covers every schema property the layout and the value
+        // mapping depend on, so a code from a package whose parameters differ
+        // is rejected outright rather than decoded into plausible looking
+        // nonsense.
 
         readonly property int shareMagic: 0x52
         readonly property int shareFormat: 1
@@ -2616,13 +2716,21 @@ Item {
             return value;
         }
 
-        // Fingerprint of everything the bit layout depends on. Two devices that
-        // agree here can decode each other's codes positionally.
+        // Fingerprint of everything the bit layout and the value mapping depend
+        // on. Two devices that agree here can decode each other's codes
+        // positionally and arrive at the same numbers.
         function schemaSignature(schema) {
             var parts = [];
             for (var i = 0; i < schema.length; i++) {
                 var e = schema[i];
-                parts.push(e.name + "|" + e.kind + "|" + e.bits + "|" + e.lo);
+                // q and span belong in here as much as the bit width does:
+                // two package versions can agree on the layout and still
+                // quantise differently (a range of 0..100 with no decimals and
+                // one of 0..10 with one decimal are both 1000 steps in 10
+                // bits), and the code would then decode into plausible wrong
+                // numbers instead of being rejected.
+                parts.push(e.name + "|" + e.kind + "|" + e.bits + "|" + e.lo
+                           + "|" + e.q + "|" + e.span);
             }
             return crc32(parts.join(","));
         }
@@ -4532,6 +4640,12 @@ Item {
         // The 12h threshold guards against small non-monotonicity, only an
         // actual day rollover moves the offset.
         function logUnfoldTime(ctx, t) {
+            // An unreadable timestamp must not become the reference: lastT
+            // would go NaN and the next comparison always be false, so a day
+            // rollover on the very next line would go unnoticed.
+            if (t !== t) {
+                return t;
+            }
             if (ctx.lastT >= 0 && t < ctx.lastT - 43200000) {
                 ctx.dayOffset += 86400000;
             }
@@ -4653,7 +4767,14 @@ Item {
             loadInfo = "";
             loadStatus = "loading...";
 
-            fileName = decodeURIComponent(fileUrl.replace(/^.*\//, ""));
+            // decodeURIComponent() throws on a stray "%" in the name; showing
+            // it undecoded beats aborting load() halfway (see logPathOf)
+            var rawName = fileUrl.replace(/^.*\//, "");
+            try {
+                fileName = decodeURIComponent(rawName);
+            } catch (e) {
+                fileName = rawName;
+            }
 
             // The position lives only in VESC Tool's own CSV (see
             // logRecorder.setupColumnNames for why). It carries the same
@@ -6382,28 +6503,12 @@ Item {
         // the plot to couple the cursor with
         property var plot
 
-        // Tile source: own proxy in front of Thunderforest, style "atlas",
-        // zoom up to 17 - a hard limit, the proxy doesn't answer above it;
-        // higher zoom upscales the existing tile level instead. The key is
-        // inserted from the file tile_api_key at build time; when loading
-        // refloatui.qml directly in VESC Tool the placeholder stays - see
-        // effectiveTileKey below.
-        readonly property string tileApiKey: "{{TILE_API_KEY}}"
+        // Tile source: own proxy in front of Thunderforest (host and key live
+        // in tileProxy), style "atlas", zoom up to 17 - a hard limit, the proxy
+        // doesn't answer above it; higher zoom upscales the existing tile level
+        // instead.
         readonly property string tileStyle: "atlas"
         readonly property int tileMaxZoom: 17
-        // Android: VESC Tool's Qt build bundles no OpenSSL (no ANDROID_EXTRA_LIBS
-        // anywhere in vesc_tool), so every https request fails there - the map
-        // stayed black. The proxy serves plain http directly (no redirect), and
-        // VESC Tool itself fetches firmware/packages over http, too. iOS and
-        // desktop use the OS TLS stack and keep https.
-        readonly property string tileUrlBase: Qt.platform.os === "android"
-            ? "http://tiles.pev-point.de" : "https://tiles.pev-point.de"
-
-        // When loading the QML directly the placeholder is not replaced; then
-        // the key comes from the settings, so it never sits in the source
-        // (refloatui.qml gets transferred into the versioned ui.qml.in)
-        readonly property string effectiveTileKey: tileApiKey.indexOf("{{") === 0
-            ? preferences.devTileApiKey : tileApiKey
 
         // View state, prepared for the tile layer (AP 5 of the log view
         // plan): zoom is the web-mercator zoom level, the world is
@@ -6511,14 +6616,6 @@ Item {
             };
         }
 
-        // Tile indexes derive from the normalized projection: one zoom level
-        // splits the world into 2^z tiles per axis
-        function tileIndex(lat, lon, z) {
-            var n = Math.pow(2, z);
-            var p = project(lat, lon);
-            return { x: p.x * n, y: p.y * n };
-        }
-
         // --- end of pure JS map projection ---------------------------------
 
         // fits center and zoom to the track's bounding box, keeping the
@@ -6599,7 +6696,7 @@ Item {
         }
 
         function tileUrl(tile) {
-            return tileUrlBase + "/" + effectiveTileKey + "/" + tileStyle + "/"
+            return tileProxy.urlBase + "/" + tileProxy.key + "/" + tileStyle + "/"
                 + tile.z + "/" + tile.x + "/" + tile.y + ".png";
         }
 
@@ -6756,7 +6853,7 @@ Item {
         Item {
             id: tileLayer
             anchors.fill: parent
-            visible: preferences.showMapTiles && trackMap.effectiveTileKey !== ""
+            visible: preferences.showMapTiles && tileProxy.key !== ""
 
             onVisibleChanged: {
                 if (visible) {
@@ -6813,15 +6910,28 @@ Item {
                 var mPerPx = Math.cos(centerLat * Math.PI / 180) * 40075016.686
                     / (256 * Math.pow(2, zoom));
                 var target = width * 0.25 * mPerPx;
-                var pow10 = Math.pow(10, Math.floor(Math.log(target) / Math.LN10));
+
+                // The 1-2-5 ladder is the same either way, only the unit it
+                // counts in changes: metres below a kilometre, feet below a
+                // quarter mile. Everything else in the UI follows
+                // vescConfig.useImperial, so the map has to as well.
+                var imperial = vescConfig.useImperial;
+                var smallM = imperial ? 0.3048 : 1;          // metres per ft / m
+                var bigM = imperial ? 1609.344 : 1000;       // metres per mi / km
+                var useBig = target >= (imperial ? bigM / 4 : bigM);
+                var unitM = useBig ? bigM : smallM;
+
+                var scaled = target / unitM;
+                var pow10 = Math.pow(10, Math.floor(Math.log(scaled) / Math.LN10));
                 var len = pow10;
-                if (target >= 5 * pow10) {
+                if (scaled >= 5 * pow10) {
                     len = 5 * pow10;
-                } else if (target >= 2 * pow10) {
+                } else if (scaled >= 2 * pow10) {
                     len = 2 * pow10;
                 }
-                var px = len / mPerPx;
-                var label = len >= 1000 ? (len / 1000) + " km" : len + " m";
+                var px = len * unitM / mPerPx;
+                var label = len + " "
+                    + (useBig ? (imperial ? "mi" : "km") : (imperial ? "ft" : "m"));
 
                 var x = 12, y = height - 12;
                 ctx.strokeStyle = "#ffffff";
@@ -7193,6 +7303,15 @@ Item {
     }
 
     Component.onDestruction: {
+        // VESC Tool destroys this UI when it rebuilds it for the next board
+        // (mobile/main.qml updateHwAppUi(), reached from onFwRxChanged), which
+        // is the path a BLE dropout with automatic reconnect takes. Without
+        // this the samples still in the buffer are lost and the GNSS
+        // foreground service and the wake lock keep running until the app
+        // itself exits - closeRtLogFile() only happens in VescInterface's
+        // destructor. stop() returns right away when nothing is recording.
+        logRecorder.stop();
+
         if (typeof confCustomLoader !== typeof undefined) {
             print("Refloat: Unhooking custom config Write button...");
             if (customConfigWriteButton) {
@@ -7740,12 +7859,12 @@ Item {
                         }
 
                         // Development only: tile key input, visible only while
-                        // the {{TILE_API_KEY}} placeholder is unreplaced -
-                        // the released package has the key baked in at build
-                        // time and never shows this field
+                        // the build time substitution has not happened - the
+                        // released package has the key baked in and never
+                        // shows this field
                         RowLayout {
                             Layout.fillWidth: true
-                            visible: "{{TILE_API_KEY}}".indexOf("{{") === 0
+                            visible: tileProxy.placeholder
 
                             LText {
                                 text: "Map tile API key (dev)"
@@ -7898,14 +8017,17 @@ Item {
                 tune.favorite = saveTuneFavorite.checked;
                 // The checkbox speaks for the connected board only: it adds or
                 // removes this one key and leaves the other boards' entries be.
-                // Disabled while disconnected, so the else branch cannot strike
-                // then - boardKey() would be a BLE address and match nothing.
+                // Without a key there is no board to speak for - storing the
+                // empty string would pin the tune to every board that cannot
+                // identify itself either, so the list stays untouched.
                 var key = tuneManager.boardKey();
-                var boards = (tune.boards || []).filter((entry) => entry !== key);
-                if (saveTuneBoard.checked) {
-                    boards.push(key);
+                if (key) {
+                    var boards = (tune.boards || []).filter((entry) => entry !== key);
+                    if (saveTuneBoard.checked) {
+                        boards.push(key);
+                    }
+                    tune.boards = boards;
                 }
-                tune.boards = boards;
                 if (tuneUuid) {
                     tuneManager.saveMyTune(tuneUuid, tune);
                 } else {
@@ -8538,13 +8660,12 @@ Item {
                     property var hermesTunes: []
 
                     // Hermes answers over https only, and Android has no TLS
-                    // (see TrackMap.tileUrlBase). There the requests take the
-                    // same proxy as the map tiles, which mirrors /tunes and
-                    // /tunes/<id>/download over http below the same key - so
-                    // host and key stay defined in exactly one place.
+                    // (see tileProxy). There the requests take the same proxy
+                    // as the map tiles, which mirrors /tunes and
+                    // /tunes/<id>/download over http below the same key.
                     readonly property string hermesUrlBase:
-                        Qt.platform.os === "android" && trackMapView && trackMapView.effectiveTileKey !== ""
-                            ? "%1/%2/hermes".arg(trackMapView.tileUrlBase).arg(trackMapView.effectiveTileKey)
+                        Qt.platform.os === "android" && tileProxy.key !== ""
+                            ? "%1/%2/hermes".arg(tileProxy.urlBase).arg(tileProxy.key)
                             : "https://ridehermes.app"
 
                     onVisibleChanged: {
@@ -9835,8 +9956,11 @@ Item {
             // The file currently being recorded is still growing (appended
             // every 100 samples) - loading that snapshot would cache wrong
             // metadata for it. It appears in the list, so guard here centrally.
+            // Compared by file name: fileUrl is a percent encoded URL while
+            // filePath is a bare path, so the two never match as a whole.
             if (logRecorder.recording && logRecorder.filePath !== ""
-                    && fileUrl.indexOf(logRecorder.filePath) !== -1) {
+                    && fileUrl.replace(/^.*\//, "")
+                       === logRecorder.filePath.replace(/^.*\//, "")) {
                 VescIf.emitStatusMessage("This log is still being recorded", false);
                 return;
             }
@@ -9916,8 +10040,16 @@ Item {
 
             text: {
                 if (logRecorder.recording) {
-                    // sampleCount updating at 10Hz also drives the elapsed time
-                    var secs = Math.max(0, Math.round((logRecorder.utcMsToday() - logRecorder.startTime) / 1000));
+                    // sampleCount updating at 10Hz also drives the elapsed time.
+                    // utcMsToday() folds back to 0 at midnight UTC, so unfold
+                    // the difference the way the log parser does - clamping it
+                    // to zero instead would stick at 00:00 for the rest of the
+                    // ride.
+                    var elapsed = logRecorder.utcMsToday() - logRecorder.startTime;
+                    if (elapsed < 0) {
+                        elapsed += 86400000;
+                    }
+                    var secs = Math.round(elapsed / 1000);
                     return "REC %1:%2 · %3 samples"
                         .arg(Math.floor(secs / 60)).arg(("0" + secs % 60).slice(-2))
                         .arg(logRecorder.sampleCount);
@@ -10041,7 +10173,11 @@ Item {
                 var line = "%1:%2".arg(Math.floor(meta.duration / 60))
                     .arg(("0" + meta.duration % 60).slice(-2));
                 if (meta.pos) {
-                    line += " · %1 km · GPS".arg((meta.distance / 1000).toFixed(1));
+                    // stored in metres; displayed in whatever unit the rest of
+                    // the UI uses
+                    line += " · %1 %2 · GPS"
+                        .arg((meta.distance / 1000 * vescConfig.imperialFactor).toFixed(1))
+                        .arg(vescConfig.distanceUnit);
                 }
                 return line;
             }
