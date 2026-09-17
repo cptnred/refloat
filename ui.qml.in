@@ -482,6 +482,31 @@ Item {
             return !name.startsWith("haptic.") && !name.startsWith("hardware.") && !tuneBlacklist.includes(name);
         }
 
+        // Default share code drops what is per-board or per-battery; "share
+        // complete config" (tuneSchema full=true) skips this filter.
+        function paramIsShared(name) {
+            if (!paramIsTune(name)) {
+                return false;
+            }
+
+            var shareBlacklist = [
+                "fault_pitch",
+                "fault_roll",
+                "fault_delay_pitch",
+                "fault_delay_roll",
+                "fault_delay_switch_half",
+                "fault_delay_switch_full",
+                "fault_adc_half_erpm",
+                "fault_is_dual_switch",
+                "fault_moving_fault_disabled",
+                "enable_quickstop",
+                "fault_darkride_enabled",
+                "fault_reversestop_enabled",
+            ];
+
+            return !name.startsWith("leds.") && !name.startsWith("bms.") && !shareBlacklist.includes(name);
+        }
+
         function fetchConfig(tuneOnly) {
             if (!checkConfig()) return null;
 
@@ -502,6 +527,55 @@ Item {
             return settings;
         }
 
+        // Positional layout for the share codec: both sides must walk the
+        // parameters in the same order. Doubles are quantised onto the grid the
+        // editor can display, one decimal finer, to keep a code scannable.
+        function tuneSchema(full) {
+            if (!checkConfig()) return null;
+
+            var schema = [];
+            for (let subGroup of pkgConfig.getParamSubgroups("General")) {
+                for (let param of pkgConfig.getParamsFromSubgroup("General", subGroup)) {
+                    if (!full && !paramIsShared(param)) {
+                        continue;
+                    }
+
+                    var kind = getParamType(param);
+                    var q = 1;
+                    var lo = 0;
+                    var span = 1;
+                    if (kind === "Double") {
+                        q = (pkgConfig.getParamEditorScale(param) || 1)
+                            * Math.pow(10, pkgConfig.getParamDecimalsDouble(param) + 1);
+                        lo = Math.round(pkgConfig.getParamMinDouble(param) * q);
+                        span = Math.round(pkgConfig.getParamMaxDouble(param) * q) - lo;
+                    } else if (kind === "Int") {
+                        lo = pkgConfig.getParamMinInt(param);
+                        span = pkgConfig.getParamMaxInt(param) - lo;
+                    } else if (kind === "Enum") {
+                        span = Math.max(1, pkgConfig.getParamEnumNames(param).length - 1);
+                    } else if (kind !== "Bool") {
+                        // no tune holds a string or a bitfield today
+                        continue;
+                    }
+
+                    var bits = 1;
+                    while (Math.pow(2, bits) - 1 < span) {
+                        bits++;
+                    }
+                    if (bits > 32) {
+                        // truncating silently would be worse than not sharing
+                        return null;
+                    }
+
+                    schema.push({"name": param, "kind": kind, "q": q,
+                                 "lo": lo, "span": span, "bits": bits});
+                }
+            }
+
+            return schema;
+        }
+
         function versionCompatible(config) {
             var [major, minor] = versionMajorMinor(config.version);
             if (major !== tuneManager.formatVersionMajor || minor > tuneManager.formatVersionMinor) {
@@ -513,10 +587,10 @@ Item {
         }
 
         function applyConfig(config) {
-            if (!checkConfig()) return;
+            if (!checkConfig()) return false;
 
             if (!versionCompatible(config)) {
-                return;
+                return false;
             }
 
             for (let [key, value] of Object.entries(config.settings)) {
@@ -536,6 +610,7 @@ Item {
             }
 
             writeConfig();
+            return true;
         }
 
         function diffConfig(other) {
@@ -558,6 +633,7 @@ Item {
                                 if (value !== otherValue) {
                                     differs.push({
                                         "name": paramName,
+                                        "group": subGroup,
                                         "value": value,
                                         "otherValue": otherValue
                                     });
@@ -921,7 +997,6 @@ Item {
         property alias showBattVoltagePerCell: prefShowBattVoltagePerCell.checked
         property alias battCurrentLog: prefBattCurrentLog.checked
         property int tempWarningOffset: 10
-        property alias tuneSlotCount: prefTuneSlotCount.value
         property alias showTuneDiffCount: prefShowTuneDiffCount.checked
         property int plotMaxWindowMinutes: 30
         property alias showWelcomeDialog: prefShowWelcomeDialog.checked
@@ -1370,19 +1445,58 @@ Item {
             property var tuneArchive
             property var tuneArchiveDownloadDate
 
+            property var myTunes
+            // Kept for downgrades: the current tune now lives under currentTuneKey().
+            property var currentTune
+            property var tuneSlotsMigrated
+
             property var fullBackup
         }
 
-        property var tunes: {
-            var tunes = {}
-            for (var slot = 1; slot <= maxTunes; slot++) {
-                var tune = loadTune(slot);
-                if (tune) {
-                    tunes[slot] = tune;
-                }
-            }
+        // Filled in Component.onCompleted, not by a binding: loadMyTunes() writes
+        // tuneStorage.myTunes while reading it, which Qt kills as a binding loop.
+        property var myTunes: []
+        // What the tunes page may show: favorites, minus those favorited for other boards only.
+        readonly property var favoriteTunes: (myTunes || []).filter((tune) => tune && tune.favorite
+            && showsOnThisBoard(tune))
+        // Split into the connected board's favorites and the board-agnostic ones.
+        readonly property var boardTunes: (favoriteTunes || []).filter((tune) => isBoardTune(tune))
+        readonly property var otherTunes: (favoriteTunes || []).filter((tune) => !isBoardTune(tune))
+        // Component.onCompleted like myTunes: resolving the reference needs myTunes.
+        property var currentTune: null
 
-            return tunes;
+        // Identity of the board in front of us. board.getId() is the last BLE
+        // address and survives a disconnect, so it is only the fallback.
+        function boardKey() {
+            return VescIf.getConnectedUuid() || board.getId();
+        }
+
+        // tune.boards holds the keys a tune is favorited for - not tune.board,
+        // which is only the stamp of where it was saved.
+        function isBoardTune(tune) {
+            if (!tune) {
+                return false;
+            }
+            // An empty key is not an identity: it would match every other
+            // board without one.
+            var key = boardKey();
+            if (!key) {
+                return false;
+            }
+            if (tune.boards) {
+                return tune.boards.indexOf(key) >= 0;
+            }
+            // beta leftover from when a tune belonged to a single board
+            return !!(tune.board && tune.board.pinned
+                && (tune.board.uuid ? tune.board.uuid === key
+                                    : tune.board.id === board.getId()));
+        }
+
+        // A tune favorited for no board at all belongs on every board's page.
+        function showsOnThisBoard(tune) {
+            var forSomeBoard = tune.boards ? tune.boards.length > 0
+                                           : !!(tune.board && tune.board.pinned);
+            return !forSomeBoard || isBoardTune(tune);
         }
 
         function replaceProperty(tune, oldName, newName) {
@@ -1418,7 +1532,43 @@ Item {
         function onUpdate() {
             triggerAutoRestore();
             // force recalculation of dependent variables
-            tunes = tunes;
+            myTunes = myTunes;
+            currentTune = currentTune;
+        }
+
+        // Check if a tune matches the current board config exactly
+        function tuneMatches(tune) {
+            if (!tune || !packageConfig.checkConfig()) {
+                return false;
+            }
+            var diff = packageConfig.diffConfig(tune);
+            return diff.differs.length === 0;
+        }
+
+        // Overwrite an existing local tune with the current board config
+        function overwriteTuneConfig(tuneUuid) {
+            var tune = findMyTune(tuneUuid);
+            if (!tune || !tune.uuid) {
+                return false;  // tune not found
+            }
+            if (tune.source && tune.source.type === "refloat-archive") {
+                return false;  // can't overwrite archive tunes
+            }
+
+            // returns the settings dict itself, not a wrapper
+            var settings = packageConfig.fetchConfig(true);
+            if (!settings) {
+                return false;
+            }
+
+            if (!updateTune(tune, tune.name, tune.description, settings)) {
+                return false;
+            }
+
+            saveMyTune(tuneUuid, tune);
+            setCurrentTune(tune);
+
+            return true;
         }
 
         property alias fullBackup: tuneStorage.fullBackup
@@ -1468,6 +1618,8 @@ Item {
                 },
                 "board": {
                     "id": board.getId(),
+                    // the ESC's own id, unlike board.getId() (the last BLE address)
+                    "uuid": VescIf.getConnectedUuid(),
                 },
                 "settings": settings
             };
@@ -1496,6 +1648,8 @@ Item {
             if (settings) {
                 tune.settings = settings;
                 tune.date = new Date();
+                // fresh from the board, so migrateTune() must not run over them again
+                tune.package = {"name": packageName, "version": packageVersion};
             }
             tune.version = formatVersion;
 
@@ -1510,6 +1664,10 @@ Item {
             }
 
             var [pMajor, pMinor] = versionMajorMinor(packageVersion);
+            // a tune from a newer package must keep its version
+            if (!(major < pMajor || (major == pMajor && minor < pMinor))) {
+                return tune;
+            }
 
             while (major < pMajor || (major == pMajor && minor < pMinor)) {
                 var versionKey = [major, minor].join(".");
@@ -1519,6 +1677,8 @@ Item {
                     minor++;
                 }
             }
+            // otherwise every load migrates the already migrated settings again
+            tune.package.version = packageVersion;
             return tune;
         }
 
@@ -1615,15 +1775,6 @@ Item {
             }
         }
 
-        function saveTune(slot, tune) {
-            var id = tuneId(slot);
-            tuneStorage.setValue(id, JSON.stringify(convertToOldFormat(tune)));
-
-            tunes[slot] = tune;
-            // workaround needed so that the change is written through to the storage
-            tunes = tunes;
-        }
-
         function loadTune(slot) {
             var tune = tuneStorage.value(tuneId(slot));
             if (tune) {
@@ -1635,15 +1786,159 @@ Item {
             return null;
         }
 
-        function eraseTune(slot) {
-            tuneStorage.setValue(tuneId(slot), "");
-            tunes[slot] = null;
-            // workaround needed so that the change is written through to the storage
-            tunes = tunes;
+        function generateUuid() {
+            return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
         }
 
-        function slotEmpty(slot) {
-            return !tuneStorage.value(tuneId(slot), null);
+        function slotsMigrated() {
+            var value = tuneStorage.tuneSlotsMigrated;
+            return value === true || value === "true";
+        }
+
+        // One-time migration of the legacy tune_slot_N storage into myTunes.
+        // The slot keys stay so downgrading remains possible.
+        function migrateTuneSlots() {
+            // A filled myTunes means the flag was lost - rerunning would overwrite newer tunes.
+            var existing = tuneStorage.myTunes;
+            if (existing) {
+                if (typeof existing === "string") {
+                    existing = JSON.parse(existing);
+                }
+                if (existing.length > 0) {
+                    tuneStorage.tuneSlotsMigrated = true;
+                    return;
+                }
+            }
+
+            var migrated = [];
+            for (var slot = 1; slot <= maxTunes; slot++) {
+                var tune = loadTune(slot);
+                if (tune) {
+                    tune.uuid = generateUuid();
+                    tune.favorite = true;
+                    tune.source = {"type": "local"};
+                    migrated.push(tune);
+                }
+            }
+            tuneStorage.myTunes = JSON.stringify(migrated);
+            tuneStorage.tuneSlotsMigrated = true;
+        }
+
+        function loadMyTunes() {
+            if (!slotsMigrated()) {
+                migrateTuneSlots();
+            }
+
+            var tunes = tuneStorage.myTunes;
+            if (!tunes) {
+                return [];
+            }
+            if (typeof tunes === "string") {
+                tunes = JSON.parse(tunes);
+            }
+            return tunes.map((tune) => tune.package ? migrateTune(tune) : tune);
+        }
+
+        function saveMyTunes(tunes) {
+            tuneStorage.myTunes = JSON.stringify(tunes);
+            // workaround needed so that the change is written through to the storage
+            myTunes = tunes;
+        }
+
+        function addMyTune(tune) {
+            if (!tune.uuid) {
+                tune.uuid = generateUuid();
+            }
+            var tunes = myTunes;
+            tunes.push(tune);
+            saveMyTunes(tunes);
+            return tune.uuid;
+        }
+
+        function findMyTuneIndex(uuid) {
+            for (var i = 0; i < myTunes.length; i++) {
+                if (myTunes[i].uuid === uuid) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        function findMyTune(uuid) {
+            var index = findMyTuneIndex(uuid);
+            return index >= 0 ? myTunes[index] : null;
+        }
+
+        function findMyTuneBySource(source) {
+            for (var i = 0; i < myTunes.length; i++) {
+                var tuneSource = myTunes[i].source;
+                if (!tuneSource || tuneSource.type !== source.type) {
+                    continue;
+                }
+                if (myTunes[i].name === source.name) {
+                    return myTunes[i];
+                }
+            }
+            return null;
+        }
+
+        function saveMyTune(uuid, tune) {
+            var index = findMyTuneIndex(uuid);
+            if (index < 0) {
+                return;
+            }
+            var tunes = myTunes;
+            tunes[index] = tune;
+            saveMyTunes(tunes);
+            if (currentTune && currentTune.uuid === uuid) {
+                // the header holds the object, not a lookup
+                currentTune = tune;
+            }
+        }
+
+        function deleteMyTune(uuid) {
+            var index = findMyTuneIndex(uuid);
+            if (index < 0) {
+                return;
+            }
+            var tunes = myTunes;
+            tunes.splice(index, 1);
+            saveMyTunes(tunes);
+            // otherwise the header keeps the deleted tune and loadCurrentTune() restores it
+            if (currentTune && currentTune.uuid === uuid) {
+                tuneStorage.setValue(currentTuneKey(), "");
+                currentTune = null;
+            }
+        }
+
+        function setFavorite(uuid, favorite) {
+            var tune = findMyTune(uuid);
+            if (!tune) {
+                return;
+            }
+            tune.favorite = favorite;
+            saveMyTunes(myTunes);
+        }
+
+        // per board: myTunes is shared by every board, the tune on one of them is not
+        function currentTuneKey() {
+            return "currentTune_" + boardKey();
+        }
+
+        function setCurrentTune(tune) {
+            tuneStorage.setValue(currentTuneKey(), JSON.stringify(tune));
+            currentTune = tune;
+        }
+
+        function loadCurrentTune() {
+            // fallback for tunes applied straight from an archive; a saved entry wins
+            var stored = tuneStorage.value(currentTuneKey());
+            if (!stored) {
+                return null;
+            }
+            var tune = typeof stored === "string" ? JSON.parse(stored) : stored;
+            // a uuid means it lived in My Tunes - once deleted there, it is gone on every board
+            return tune.uuid ? findMyTune(tune.uuid) : tune;
         }
 
         function saveTuneArchive(tuneArchive) {
@@ -1715,6 +2010,8 @@ Item {
         }
 
         Component.onCompleted: {
+            myTunes = loadMyTunes();
+            currentTune = loadCurrentTune();
             var idBackup = loadBackup("backup_" + board.getId());
             if (idBackup) {
                 idBackupFinished(idBackup);
@@ -1724,6 +2021,806 @@ Item {
                 autoBackupFinished(autoBackup);
             }
         }
+    }
+
+    // Share codes: a compact binary payload, base64 for pasting and the same
+    // text as a QR symbol. Plain Javascript, lifted out and tested with node.
+    QtObject {
+        id: tuneCodec
+
+        // Built once per flavour: walking every parameter per keystroke is too slow.
+        property var cachedSchema: null
+        property var cachedSchemaFull: null
+
+        // full picks the complete schema over the reduced default one
+        function sharedSchema(full) {
+            if (full) {
+                if (!cachedSchemaFull) {
+                    cachedSchemaFull = packageConfig.tuneSchema(true);
+                }
+                return cachedSchemaFull;
+            }
+            if (!cachedSchema) {
+                cachedSchema = packageConfig.tuneSchema(false);
+            }
+            return cachedSchema;
+        }
+
+        // Text for the QR symbol and the copy field, or null without a board.
+        function shareCode(tune, full) {
+            var schema = sharedSchema(full);
+            if (!schema || !tune) {
+                return null;
+            }
+            // A tune only holds paramIsTune values, so a complete config is the
+            // board's own one with the tune laid over it.
+            var settings = full
+                ? Object.assign(packageConfig.fetchConfig(false) || {}, tune.settings || {})
+                : tune.settings || {};
+            return toBase64(encodeShare(schema, tune.name, settings));
+        }
+
+        // {name, settings} or {error}. A code does not say which schema built
+        // it, so the embedded signature picks one.
+        function parseShareCode(text) {
+            var schema = sharedSchema(false);
+            var schemaFull = sharedSchema(true);
+            if (!schema && !schemaFull) {
+                return {"error": "Connect to a board first, a code can only be read against its parameters."};
+            }
+
+            var bytes = fromBase64((text || "").trim());
+            var sig = payloadSignature(bytes);
+            var chosen = (schema && schemaSignature(schema) === sig) ? schema
+                : (schemaFull && schemaSignature(schemaFull) === sig) ? schemaFull
+                : (schema || schemaFull);
+            return decodeShare(chosen, bytes);
+        }
+
+        // --- pure JS base64, no QML references -----------------------------
+        // Own encoder: Qt.btoa() converts to UTF-8 first and String.fromCharCode
+        // .apply() hands back NULs for typed arrays in QML's V4 engine.
+        readonly property string base64Chars: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+        function toBase64(bytes) {
+            var chars = base64Chars;
+            var n = bytes.length;
+            // join instead of +=: repeated concatenation gets slow
+            var parts = [];
+            var chunk = "";
+            for (var i = 0; i < n; i += 3) {
+                var b0 = bytes[i];
+                var b1 = i + 1 < n ? bytes[i + 1] : 0;
+                var b2 = i + 2 < n ? bytes[i + 2] : 0;
+                chunk += chars.charAt(b0 >> 2)
+                    + chars.charAt(((b0 & 3) << 4) | (b1 >> 4))
+                    + (i + 1 < n ? chars.charAt(((b1 & 15) << 2) | (b2 >> 6)) : "=")
+                    + (i + 2 < n ? chars.charAt(b2 & 63) : "=");
+                if (chunk.length >= 8192) {
+                    parts.push(chunk);
+                    chunk = "";
+                }
+            }
+            parts.push(chunk);
+            return parts.join("");
+        }
+
+        function fromBase64(text) {
+            var chars = base64Chars;
+            var bytes = [];
+            var buffer = 0;
+            var bits = 0;
+            for (var i = 0; i < text.length; i++) {
+                var c = chars.indexOf(text.charAt(i));
+                if (c < 0) {
+                    // padding, whitespace and line breaks a pasted code picked up
+                    continue;
+                }
+                buffer = (buffer << 6) | c;
+                bits += 6;
+                if (bits >= 8) {
+                    bits -= 8;
+                    bytes.push((buffer >> bits) & 0xff);
+                }
+            }
+            return bytes;
+        }
+
+        // --- end of pure JS base64 -----------------------------------------
+
+        // --- pure JS share code payload, no QML references ------------------
+        // Layout, all big endian:
+        //   'R' | format version | schema signature (4) | name length |
+        //   name (UTF-8) | presence bitmask (one bit per schema entry) |
+        //   bit packed values of the present entries | CRC-16 (2)
+
+        readonly property int shareMagic: 0x52
+        readonly property int shareFormat: 1
+        readonly property int shareNameMax: 30
+
+        function utf8Encode(text) {
+            var bytes = [];
+            for (var i = 0; i < text.length; i++) {
+                var c = text.charCodeAt(i);
+                if (c < 0x80) {
+                    bytes.push(c);
+                } else if (c < 0x800) {
+                    bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+                } else {
+                    bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+                }
+            }
+            return bytes;
+        }
+
+        function utf8Decode(bytes, from, len) {
+            var text = "";
+            var i = from;
+            var end = from + len;
+            while (i < end) {
+                var c = bytes[i++];
+                if (c >= 0xf0) {
+                    // beyond the basic plane; the name field never carries this
+                    i += 3;
+                    continue;
+                } else if (c >= 0xe0) {
+                    c = ((c & 0x0f) << 12) | ((bytes[i] & 0x3f) << 6) | (bytes[i + 1] & 0x3f);
+                    i += 2;
+                } else if (c >= 0xc0) {
+                    c = ((c & 0x1f) << 6) | (bytes[i] & 0x3f);
+                    i += 1;
+                }
+                text += String.fromCharCode(c);
+            }
+            return text;
+        }
+
+        function crc32(text) {
+            var crc = -1;
+            for (var i = 0; i < text.length; i++) {
+                crc ^= text.charCodeAt(i) & 0xff;
+                for (var b = 0; b < 8; b++) {
+                    crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+                }
+            }
+            return (crc ^ -1) >>> 0;
+        }
+
+        // CRC-16/CCITT-FALSE; the pasted text variant has no other check.
+        function crc16(bytes, len) {
+            var crc = 0xffff;
+            for (var i = 0; i < len; i++) {
+                crc ^= bytes[i] << 8;
+                for (var b = 0; b < 8; b++) {
+                    crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff;
+                }
+            }
+            return crc;
+        }
+
+        function writeBits(out, value, bits) {
+            for (var b = bits - 1; b >= 0; b--) {
+                if ((out.bit & 7) === 0) {
+                    out.bytes.push(0);
+                }
+                if (Math.floor(value / Math.pow(2, b)) % 2) {
+                    out.bytes[out.bytes.length - 1] |= 0x80 >> (out.bit & 7);
+                }
+                out.bit++;
+            }
+        }
+
+        function readBits(inp, bits) {
+            var value = 0;
+            for (var b = 0; b < bits; b++) {
+                var cur = inp.bytes[inp.from + (inp.bit >> 3)];
+                value = value * 2 + ((cur >> (7 - (inp.bit & 7))) & 1);
+                inp.bit++;
+            }
+            return value;
+        }
+
+        // Fingerprint of everything the bit layout and the value mapping depend on.
+        function schemaSignature(schema) {
+            var parts = [];
+            for (var i = 0; i < schema.length; i++) {
+                var e = schema[i];
+                // q and span matter as much as the bit width: the same layout with a
+                // different quantisation would decode into plausible wrong numbers.
+                parts.push(e.name + "|" + e.kind + "|" + e.bits + "|" + e.lo
+                           + "|" + e.q + "|" + e.span);
+            }
+            return crc32(parts.join(","));
+        }
+
+        // Signature read without knowing which schema produced the payload.
+        function payloadSignature(bytes) {
+            if (!bytes || bytes.length < 6) {
+                return null;
+            }
+            return (bytes[2] * 16777216) + (bytes[3] << 16) + (bytes[4] << 8) + bytes[5];
+        }
+
+        function encodeShare(schema, name, settings) {
+            var i;
+            var bytes = [shareMagic, shareFormat];
+            var sig = schemaSignature(schema);
+            bytes.push((sig >>> 24) & 0xff, (sig >>> 16) & 0xff, (sig >>> 8) & 0xff, sig & 0xff);
+
+            var nameBytes = utf8Encode((name || "").slice(0, shareNameMax));
+            bytes.push(nameBytes.length);
+            for (i = 0; i < nameBytes.length; i++) {
+                bytes.push(nameBytes[i]);
+            }
+
+            var maskLen = Math.ceil(schema.length / 8);
+            var mask = [];
+            for (i = 0; i < maskLen; i++) {
+                mask.push(0);
+            }
+            var values = {"bytes": [], "bit": 0};
+            for (i = 0; i < schema.length; i++) {
+                var e = schema[i];
+                if (!settings.hasOwnProperty(e.name)) {
+                    continue;
+                }
+                mask[i >> 3] |= 0x80 >> (i & 7);
+                var raw = e.kind === "Bool"
+                    ? (settings[e.name] ? 1 : 0)
+                    : Math.round(settings[e.name] * e.q) - e.lo;
+                writeBits(values, Math.max(0, Math.min(e.span, raw)), e.bits);
+            }
+            for (i = 0; i < maskLen; i++) {
+                bytes.push(mask[i]);
+            }
+            for (i = 0; i < values.bytes.length; i++) {
+                bytes.push(values.bytes[i]);
+            }
+
+            var crc = crc16(bytes, bytes.length);
+            bytes.push((crc >> 8) & 0xff, crc & 0xff);
+            return bytes;
+        }
+
+        // Returns {name, settings} or {error} - never a partial result.
+        function decodeShare(schema, bytes) {
+            var i;
+            if (!bytes || bytes.length < 10) {
+                return {"error": "Code is too short."};
+            }
+            if (bytes[0] !== shareMagic) {
+                return {"error": "This is not a tune code."};
+            }
+            if (bytes[1] !== shareFormat) {
+                return {"error": "Code uses a newer format than this package understands."};
+            }
+            var crc = crc16(bytes, bytes.length - 2);
+            if (((crc >> 8) & 0xff) !== bytes[bytes.length - 2] || (crc & 0xff) !== bytes[bytes.length - 1]) {
+                return {"error": "Code is damaged or incomplete."};
+            }
+            var sig = schemaSignature(schema);
+            var codeSig = payloadSignature(bytes);
+            if (codeSig !== sig) {
+                return {"error": "Code comes from a different package version."};
+            }
+
+            var nameLen = bytes[6];
+            var pos = 7 + nameLen;
+            var maskLen = Math.ceil(schema.length / 8);
+            if (pos + maskLen + 2 > bytes.length) {
+                return {"error": "Code is damaged or incomplete."};
+            }
+            var name = utf8Decode(bytes, 7, nameLen);
+
+            var present = [];
+            var bitCount = 0;
+            for (i = 0; i < schema.length; i++) {
+                var set = ((bytes[pos + (i >> 3)] >> (7 - (i & 7))) & 1) !== 0;
+                present.push(set);
+                if (set) {
+                    bitCount += schema[i].bits;
+                }
+            }
+            pos += maskLen;
+            if (pos + Math.ceil(bitCount / 8) + 2 > bytes.length) {
+                return {"error": "Code is damaged or incomplete."};
+            }
+
+            var inp = {"bytes": bytes, "from": pos, "bit": 0};
+            var settings = {};
+            for (i = 0; i < schema.length; i++) {
+                if (!present[i]) {
+                    continue;
+                }
+                var e = schema[i];
+                var raw = readBits(inp, e.bits);
+                if (raw > e.span) {
+                    return {"error": "Code is damaged or incomplete."};
+                }
+                if (e.kind === "Bool") {
+                    settings[e.name] = raw !== 0;
+                } else if (e.kind === "Double") {
+                    settings[e.name] = (raw + e.lo) / e.q;
+                } else {
+                    settings[e.name] = raw + e.lo;
+                }
+            }
+            return {"name": name, "settings": settings};
+        }
+
+        // --- end of pure JS share code payload ------------------------------
+
+        // --- pure JS QR encoder, no QML references --------------------------
+        // Byte mode, EC level M, versions 1-20. Only the EC codewords and block
+        // counts are tabulated, the rest is derived at runtime to save flash.
+
+        function qrRawDataModules(version) {
+            var result = (16 * version + 128) * version + 64;
+            if (version >= 2) {
+                var numAlign = Math.floor(version / 7) + 2;
+                result -= (25 * numAlign - 10) * numAlign - 55;
+                if (version >= 7) {
+                    result -= 36;
+                }
+            }
+            return result;
+        }
+
+        // [EC codewords per block, number of blocks] for level M, version 1..20
+        function qrBlockInfo(version) {
+            var table = [10, 1, 16, 1, 26, 1, 18, 2, 24, 2, 16, 4, 18, 4, 22, 4,
+                         22, 5, 26, 5, 30, 5, 22, 8, 22, 9, 24, 9, 24, 10, 28, 10,
+                         28, 11, 26, 13, 26, 14, 26, 16];
+            var i = (version - 1) * 2;
+            return [table[i], table[i + 1]];
+        }
+
+        // Payload bytes that fit in a byte-mode symbol of this version.
+        function qrCapacity(version) {
+            var info = qrBlockInfo(version);
+            var dataCodewords = Math.floor(qrRawDataModules(version) / 8) - info[0] * info[1];
+            var header = 4 + (version < 10 ? 8 : 16);
+            return Math.floor((dataCodewords * 8 - header) / 8);
+        }
+
+        // Centres of the alignment patterns: first is always 6, last always
+        // 4 * version + 10, the rest evenly spaced on even coordinates.
+        function qrAlignPositions(version) {
+            if (version === 1) {
+                return [];
+            }
+            var count = Math.floor(version / 7) + 2;
+            var last = version * 4 + 10;
+            var step = Math.ceil((last - 6) / (count - 1) / 2) * 2;
+            var pos = [6];
+            for (var i = 1; i < count; i++) {
+                pos.push(last - (count - 1 - i) * step);
+            }
+            return pos;
+        }
+
+        // Log/antilog tables of GF(256) with the QR primitive polynomial 0x11d.
+        // The antilog table is doubled so index sums never need a modulo.
+        function qrGfTables() {
+            var exp = new Array(512);
+            var log = new Array(256);
+            var x = 1;
+            for (var i = 0; i < 255; i++) {
+                exp[i] = x;
+                log[x] = i;
+                x <<= 1;
+                if (x & 0x100) {
+                    x ^= 0x11d;
+                }
+            }
+            for (var j = 255; j < 512; j++) {
+                exp[j] = exp[j - 255];
+            }
+            return [exp, log];
+        }
+
+        // Reed-Solomon remainder of one block, the EC codewords appended to it.
+        function qrEcCodewords(data, ecLen, gf) {
+            var exp = gf[0];
+            var log = gf[1];
+            var gen = [1];
+            var i, j;
+            for (i = 0; i < ecLen; i++) {
+                var next = [];
+                for (j = 0; j <= gen.length; j++) {
+                    next.push(0);
+                }
+                for (j = 0; j < gen.length; j++) {
+                    next[j] ^= gen[j];
+                    if (gen[j]) {
+                        next[j + 1] ^= exp[log[gen[j]] + i];
+                    }
+                }
+                gen = next;
+            }
+
+            var rem = [];
+            for (i = 0; i < ecLen; i++) {
+                rem.push(0);
+            }
+            for (i = 0; i < data.length; i++) {
+                var factor = data[i] ^ rem[0];
+                rem.shift();
+                rem.push(0);
+                if (factor) {
+                    for (j = 0; j < ecLen; j++) {
+                        rem[j] ^= exp[log[factor] + log[gen[j + 1]]];
+                    }
+                }
+            }
+            return rem;
+        }
+
+        // Mode indicator, length, payload, terminator and padding, then split
+        // into blocks and interleaved the way the spec prescribes.
+        function qrCodewords(bytes, version) {
+            var info = qrBlockInfo(version);
+            var ecLen = info[0];
+            var numBlocks = info[1];
+            var dataCodewords = Math.floor(qrRawDataModules(version) / 8) - ecLen * numBlocks;
+
+            var bits = [];
+            var appendBits = function(value, len) {
+                for (var b = len - 1; b >= 0; b--) {
+                    bits.push((value >>> b) & 1);
+                }
+            };
+            appendBits(4, 4);
+            appendBits(bytes.length, version < 10 ? 8 : 16);
+            for (var i = 0; i < bytes.length; i++) {
+                appendBits(bytes[i], 8);
+            }
+            appendBits(0, Math.min(4, dataCodewords * 8 - bits.length));
+            appendBits(0, (8 - bits.length % 8) % 8);
+
+            var data = [];
+            for (i = 0; i < bits.length; i += 8) {
+                var cw = 0;
+                for (var b = 0; b < 8; b++) {
+                    cw = (cw << 1) | bits[i + b];
+                }
+                data.push(cw);
+            }
+            for (var pad = 0xec; data.length < dataCodewords; pad ^= 0xec ^ 0x11) {
+                data.push(pad);
+            }
+
+            var shortLen = Math.floor(dataCodewords / numBlocks);
+            var numLong = dataCodewords % numBlocks;
+            var gf = qrGfTables();
+            var blocks = [];
+            var ecBlocks = [];
+            var offset = 0;
+            for (i = 0; i < numBlocks; i++) {
+                var len = shortLen + (i >= numBlocks - numLong ? 1 : 0);
+                var block = data.slice(offset, offset + len);
+                offset += len;
+                blocks.push(block);
+                ecBlocks.push(qrEcCodewords(block, ecLen, gf));
+            }
+
+            var result = [];
+            for (i = 0; i < shortLen + 1; i++) {
+                for (var k = 0; k < numBlocks; k++) {
+                    if (i < blocks[k].length) {
+                        result.push(blocks[k][i]);
+                    }
+                }
+            }
+            for (i = 0; i < ecLen; i++) {
+                for (var m = 0; m < numBlocks; m++) {
+                    result.push(ecBlocks[m][i]);
+                }
+            }
+            return result;
+        }
+
+        function qrMask(mask, x, y) {
+            switch (mask) {
+            case 0: return (x + y) % 2 === 0;
+            case 1: return y % 2 === 0;
+            case 2: return x % 3 === 0;
+            case 3: return (x + y) % 3 === 0;
+            case 4: return (Math.floor(x / 3) + Math.floor(y / 2)) % 2 === 0;
+            case 5: return x * y % 2 + x * y % 3 === 0;
+            case 6: return (x * y % 2 + x * y % 3) % 2 === 0;
+            default: return ((x + y) % 2 + x * y % 3) % 2 === 0;
+            }
+        }
+
+        // The four penalty rules from the spec; the lowest total wins.
+        function qrPenalty(modules, size) {
+            var score = 0;
+            var x, y, run, i;
+            var at = function(px, py) {
+                return modules[py * size + px];
+            };
+
+            // rule 1: runs of five or more in a row or column
+            for (y = 0; y < size; y++) {
+                run = 1;
+                for (x = 1; x < size; x++) {
+                    if (at(x, y) === at(x - 1, y)) {
+                        run++;
+                        if (run === 5) {
+                            score += 3;
+                        } else if (run > 5) {
+                            score++;
+                        }
+                    } else {
+                        run = 1;
+                    }
+                }
+            }
+            for (x = 0; x < size; x++) {
+                run = 1;
+                for (y = 1; y < size; y++) {
+                    if (at(x, y) === at(x, y - 1)) {
+                        run++;
+                        if (run === 5) {
+                            score += 3;
+                        } else if (run > 5) {
+                            score++;
+                        }
+                    } else {
+                        run = 1;
+                    }
+                }
+            }
+
+            // rule 2: solid two by two blocks
+            for (y = 0; y < size - 1; y++) {
+                for (x = 0; x < size - 1; x++) {
+                    var c = at(x, y);
+                    if (c === at(x + 1, y) && c === at(x, y + 1) && c === at(x + 1, y + 1)) {
+                        score += 3;
+                    }
+                }
+            }
+
+            // rule 3: finder-like 1011101 with four light modules on either side
+            var pattern = [true, false, true, true, true, false, true];
+            var light = [false, false, false, false];
+            var matches = function(get, start, seq) {
+                for (var k = 0; k < seq.length; k++) {
+                    if (get(start + k) !== seq[k]) {
+                        return false;
+                    }
+                }
+                return true;
+            };
+            var checkLine = function(get) {
+                for (var s = 0; s + 6 < size; s++) {
+                    if (!matches(get, s, pattern)) {
+                        continue;
+                    }
+                    var before = true;
+                    var after = true;
+                    for (var k = 1; k <= 4; k++) {
+                        if (s - k >= 0 && get(s - k)) {
+                            before = false;
+                        }
+                        if (s + 6 + k < size && get(s + 6 + k)) {
+                            after = false;
+                        }
+                    }
+                    if (before || after) {
+                        score += 40;
+                    }
+                }
+            };
+            for (y = 0; y < size; y++) {
+                checkLine((function(row) {
+                    return function(px) {
+                        return px >= 0 && px < size ? at(px, row) : false;
+                    };
+                })(y));
+            }
+            for (x = 0; x < size; x++) {
+                checkLine((function(col) {
+                    return function(py) {
+                        return py >= 0 && py < size ? at(col, py) : false;
+                    };
+                })(x));
+            }
+
+            // rule 4: deviation of the dark module share from 50 percent
+            var dark = 0;
+            for (i = 0; i < modules.length; i++) {
+                if (modules[i]) {
+                    dark++;
+                }
+            }
+            var total = size * size;
+            score += Math.floor(Math.abs(dark * 20 - total * 10) / total) * 10;
+            return score;
+        }
+
+        // Builds the symbol for one version and returns
+        // {size, modules} with modules a row-major array of booleans.
+        function qrRender(bytes, version) {
+            var size = version * 4 + 17;
+            var modules = new Array(size * size);
+            var isFunc = new Array(size * size);
+            var i, j, x, y, dx, dy;
+            for (i = 0; i < size * size; i++) {
+                modules[i] = false;
+                isFunc[i] = false;
+            }
+            var setFunc = function(px, py, dark) {
+                modules[py * size + px] = dark;
+                isFunc[py * size + px] = true;
+            };
+
+            // timing patterns
+            for (i = 0; i < size; i++) {
+                setFunc(6, i, i % 2 === 0);
+                setFunc(i, 6, i % 2 === 0);
+            }
+
+            // finder patterns with their separators
+            var finders = [[3, 3], [size - 4, 3], [3, size - 4]];
+            for (i = 0; i < finders.length; i++) {
+                for (dy = -4; dy <= 4; dy++) {
+                    for (dx = -4; dx <= 4; dx++) {
+                        var dist = Math.max(Math.abs(dx), Math.abs(dy));
+                        x = finders[i][0] + dx;
+                        y = finders[i][1] + dy;
+                        if (x >= 0 && x < size && y >= 0 && y < size) {
+                            setFunc(x, y, dist !== 2 && dist !== 4);
+                        }
+                    }
+                }
+            }
+
+            // alignment patterns, minus the three that would sit on a finder
+            var pos = qrAlignPositions(version);
+            for (i = 0; i < pos.length; i++) {
+                for (j = 0; j < pos.length; j++) {
+                    if ((i === 0 && j === 0) || (i === 0 && j === pos.length - 1)
+                            || (i === pos.length - 1 && j === 0)) {
+                        continue;
+                    }
+                    for (dy = -2; dy <= 2; dy++) {
+                        for (dx = -2; dx <= 2; dx++) {
+                            setFunc(pos[i] + dx, pos[j] + dy,
+                                    Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
+                        }
+                    }
+                }
+            }
+
+            // version information, only from version 7 up
+            if (version >= 7) {
+                var rem = version;
+                for (i = 0; i < 12; i++) {
+                    rem = (rem << 1) ^ ((rem >>> 11) * 0x1f25);
+                }
+                var verBits = version << 12 | rem;
+                for (i = 0; i < 18; i++) {
+                    var bit = ((verBits >>> i) & 1) !== 0;
+                    var a = size - 11 + i % 3;
+                    var b = Math.floor(i / 3);
+                    setFunc(a, b, bit);
+                    setFunc(b, a, bit);
+                }
+            }
+
+            // reserve the format areas so the data placement skips them
+            qrDrawFormat(modules, size, 0, isFunc);
+
+            // data placement: two columns at a time, right to left, alternating
+            // upward and downward, skipping the vertical timing column
+            var data = qrCodewords(bytes, version);
+            var bitIndex = 0;
+            for (var right = size - 1; right >= 1; right -= 2) {
+                if (right === 6) {
+                    right = 5;
+                }
+                for (var vert = 0; vert < size; vert++) {
+                    for (j = 0; j < 2; j++) {
+                        x = right - j;
+                        var upward = ((right + 1) & 2) === 0;
+                        y = upward ? size - 1 - vert : vert;
+                        if (!isFunc[y * size + x] && bitIndex < data.length * 8) {
+                            modules[y * size + x] =
+                                ((data[bitIndex >>> 3] >>> (7 - (bitIndex & 7))) & 1) !== 0;
+                            bitIndex++;
+                        }
+                    }
+                }
+            }
+
+            // try every mask, keep the one the spec's penalty rules like best
+            var best = -1;
+            var bestScore = -1;
+            var masked = new Array(size * size);
+            for (var mask = 0; mask < 8; mask++) {
+                for (y = 0; y < size; y++) {
+                    for (x = 0; x < size; x++) {
+                        var idx = y * size + x;
+                        masked[idx] = isFunc[idx]
+                            ? modules[idx]
+                            : (modules[idx] !== qrMask(mask, x, y));
+                    }
+                }
+                qrDrawFormat(masked, size, mask, null);
+                var score = qrPenalty(masked, size);
+                if (best < 0 || score < bestScore) {
+                    best = mask;
+                    bestScore = score;
+                }
+            }
+
+            for (y = 0; y < size; y++) {
+                for (x = 0; x < size; x++) {
+                    var fi = y * size + x;
+                    if (!isFunc[fi] && qrMask(best, x, y)) {
+                        modules[fi] = !modules[fi];
+                    }
+                }
+            }
+            qrDrawFormat(modules, size, best, null);
+            return {"size": size, "modules": modules};
+        }
+
+        // 15 bit BCH format information, written twice, plus the dark module.
+        // Passing isFunc reserves the same modules before the data is placed.
+        function qrDrawFormat(modules, size, mask, isFunc) {
+            var data = mask;
+            var rem = data;
+            for (var k = 0; k < 10; k++) {
+                rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
+            }
+            var bits = ((data << 10) | rem) ^ 0x5412;
+            var bit = function(n) {
+                return ((bits >>> n) & 1) !== 0;
+            };
+            var set = function(px, py, v) {
+                modules[py * size + px] = v;
+                if (isFunc) {
+                    isFunc[py * size + px] = true;
+                }
+            };
+            var i;
+            for (i = 0; i <= 5; i++) {
+                set(8, i, bit(i));
+            }
+            set(8, 7, bit(6));
+            set(8, 8, bit(7));
+            set(7, 8, bit(8));
+            for (i = 9; i < 15; i++) {
+                set(14 - i, 8, bit(i));
+            }
+            for (i = 0; i < 8; i++) {
+                set(size - 1 - i, 8, bit(i));
+            }
+            for (i = 8; i < 15; i++) {
+                set(8, size - 15 + i, bit(i));
+            }
+            set(8, size - 8, true);
+        }
+
+        // ASCII in, {size, modules} out, or null if it does not fit version 20.
+        function qrEncode(text) {
+            var bytes = [];
+            for (var i = 0; i < text.length; i++) {
+                bytes.push(text.charCodeAt(i) & 0xff);
+            }
+            for (var version = 1; version <= 20; version++) {
+                if (bytes.length <= qrCapacity(version)) {
+                    return qrRender(bytes, version);
+                }
+            }
+            return null;
+        }
+
+        // --- end of pure JS QR encoder --------------------------------------
     }
 
     property var state: QtObject {
@@ -5161,30 +6258,6 @@ Item {
                             text: "Motor/Controller temperatures will be highlighted red if above TEMP - OFFSET, where TEMP is your Motor/MOSFET Temp Cutoff Start in Motor config. The package beeps when temperatures cross the TEMP - 3°C threshold and pushback triggers at TEMP - 2°C."
                         }
 
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Layout.rightMargin: 20
-
-                            LText {
-                                text: "Number of tune slots"
-                            }
-
-                            Slider {
-                                id: prefTuneSlotCount
-                                Layout.fillWidth: true
-
-                                from: 2
-                                to: tuneManager.maxTunes
-                                value: 6
-                                stepSize: 1
-                            }
-
-                            LText {
-                                text: prefTuneSlotCount.value
-                                font.pointSize: 16
-                            }
-                        }
-
                         RightSwitch {
                             id: prefShowTuneDiffCount
                             checked: false
@@ -5286,12 +6359,24 @@ Item {
         title: tune ? "Edit Tune" : "Save Tune"
         standardButtons: !!tune ? Dialog.Save | Dialog.Discard | Dialog.Close : Dialog.Save | Dialog.Close
 
-        property var tuneSlot
+        property string tuneUuid
         property var tune: null
+        // read once per opening: neither call is a property, a binding never updates
+        property bool boardConnected: false
+        // An archive tune stays the archive's: values and name are never written
+        // back, only the local extras are editable here.
+        property bool fromArchive: false
 
-        function show(slot) {
-            tuneSlot = slot;
-            tune = tuneManager.loadTune(slot);
+        function show(uuid) {
+            tuneUuid = uuid || "";
+            // deep copy, so canceling the dialog doesn't mutate the stored tune
+            var stored = tuneUuid ? tuneManager.findMyTune(tuneUuid) : null;
+            tune = stored ? JSON.parse(JSON.stringify(stored)) : null;
+            saveTuneFavorite.checked = tune ? !!tune.favorite : true;
+            boardConnected = VescIf.isPortConnected();
+            saveTuneBoard.checked = boardConnected && tuneManager.isBoardTune(tune);
+            fromArchive = !!(tune && tune.source
+                && tune.source.type === "refloat-archive");
             editTuneDiff.setModel(packageConfig.diffConfig(tune).differs);
             editTuneDiff.reset();
 
@@ -5311,19 +6396,38 @@ Item {
             if (saveTuneNameInput.text) {
                 if (!tune) {
                     tune = tuneManager.createTune(saveTuneNameInput.text, saveTuneDescInput.text, packageConfig.fetchConfig(true));
+                    tune.source = {"type": "local"};
                 } else {
-                    var success = tuneManager.updateTune(tune, saveTuneNameInput.text, saveTuneDescInput.text, saveTuneOverwrite.checked ? packageConfig.fetchConfig(true) : null);
+                    // no settings: a changed tune is a new one via "Pull and Save from board"
+                    var success = tuneManager.updateTune(tune, saveTuneNameInput.text, saveTuneDescInput.text, null);
                     if (!success) {
                         return;
                     }
                 }
-                tuneManager.saveTune(tuneSlot, tune);
+                tune.favorite = saveTuneFavorite.checked;
+                // Adds or removes this board's key only. Without a key there is nothing
+                // to pin to - the empty string would match every unidentified board.
+                var key = tuneManager.boardKey();
+                if (key) {
+                    var boards = (tune.boards || []).filter((entry) => entry !== key);
+                    if (saveTuneBoard.checked) {
+                        boards.push(key);
+                    }
+                    tune.boards = boards;
+                }
+                if (tuneUuid) {
+                    tuneManager.saveMyTune(tuneUuid, tune);
+                } else {
+                    tuneManager.addMyTune(tune);
+                    // only pulling from the board marks it current, editing metadata does not
+                    tuneManager.setCurrentTune(tune);
+                }
                 VescIf.emitStatusMessage(saveTuneNameInput.text + " saved", true);
             }
         }
 
         onDiscarded: {
-            tuneManager.eraseTune(tuneSlot);
+            tuneManager.deleteMyTune(tuneUuid);
             VescIf.emitStatusMessage(tune.name + " erased", true);
             close();
         }
@@ -5349,6 +6453,7 @@ Item {
                     id: saveTuneNameInput
                     Layout.fillWidth: true
 
+                    enabled: !editTuneDialog.fromArchive
                     maximumLength: 30
                     text: editTuneDialog.tuneAttr("name")
 
@@ -5379,111 +6484,689 @@ Item {
                 isTune: true
             }
 
+            // archive tunes are read-only, matching ones have nothing to overwrite
+            Button {
+                Layout.fillWidth: true
+                visible: !!editTuneDialog.tune && !editTuneDialog.fromArchive && editTuneDiff.diffCount > 0
+                text: "Overwrite Tune with Current Config"
+
+                onClicked: {
+                    if (tuneManager.overwriteTuneConfig(editTuneDialog.tuneUuid)) {
+                        VescIf.emitStatusMessage(editTuneDialog.tuneAttr("name") + " updated", true);
+                    } else {
+                        VescIf.emitStatusMessage("Failed to update tune", false);
+                    }
+                    editTuneDialog.close();
+                }
+            }
+
             CheckBox {
-                id: saveTuneOverwrite
+                id: saveTuneFavorite
 
                 checked: true
-                visible: editTuneDialog.tune && !editTuneDiff.isEmpty
-                text: "Overwrite with current tune"
+                text: "Show on Tunes tab (favorite)"
+            }
+
+            CheckBox {
+                id: saveTuneBoard
+
+                enabled: editTuneDialog.boardConnected
+                // boardNameText keeps up with renames, board.getName() would not re-evaluate
+                text: editTuneDialog.boardConnected
+                    ? "Show only on %1".arg(boardNameText.name || "this board")
+                    : "Show only on this board (not connected)"
             }
         }
     }
 
     BaseDialog {
-        id: tuneArchiveDialog
-        implicitHeight: fullHeight
-        clip: true
+        id: shareTuneDialog
 
-        title: "Tune Archive"
-        standardButtons: Dialog.Reset | Dialog.Close
+        title: "Share Tune"
+        standardButtons: Dialog.Close
 
-        function download() {
-            tuneArchiveDownloadStatus.text = "Downloading tunes...";
-            var http = new XMLHttpRequest();
-            var url = "http://us-central1-mimetic-union-377520.cloudfunctions.net/float_package_tunes_via_http";
-            http.open("GET", url, true);
-            http.onreadystatechange = function() {
-                if (http.readyState === XMLHttpRequest.DONE) {
-                    if (http.status === 200) {
-                        tuneArchiveDownloadStatus.text = "Download succesful.";
+        property var tune: null
+        property string code: ""
 
-                        var tunes = tuneManager.parseCsv(http.responseText);
-                        tuneManager.saveTuneArchive(tunes);
-                        downloadedTunesModel.setTunes(tunes);
-                    } else if (http.status === 0) {
-                        tuneArchiveDownloadStatus.text = "Download failed: Connection error";
-                    } else {
-                        tuneArchiveDownloadStatus.text = "Download failed: %1 - %2".arg(http.status).arg(http.statusText);
-                    }
-                }
-
-            };
-
-            http.send();
-        }
-
-        function show() {
+        function show(shared) {
+            tune = shared;
+            shareFullConfigCheck.checked = false;
+            updateCode();
             open();
-
-            var tuneArchive = tuneManager.loadTuneArchive();
-            // backwards compatibility: Check for the first item settings not being an array (if it is, redownload)
-            if (tuneArchive && tuneArchive.length > 0 && !Array.isArray(tuneArchive[0].settings)) {
-                downloadedTunesModel.setTunes(tuneArchive);
-                tuneArchiveDownloadStatus.text = "Tunes downloaded on %1".arg(tuneManager.getTuneArchiveDate());
-            } else {
-                download();
-            }
         }
 
-        onReset: {
-            download();
-        }
-
-        Component.onCompleted: {
-            standardButton(Dialog.Reset).text = "Refresh"
+        function updateCode() {
+            code = tuneCodec.shareCode(tune, shareFullConfigCheck.checked) || "";
+            qrCanvas.symbol = code ? tuneCodec.qrEncode(code) : null;
         }
 
         ColumnLayout {
-            anchors.centerIn: parent
-            width: parent.width * 0.95
-            height: parent.height
-            spacing: 15
-            clip: true
+            width: shareTuneDialog.availableWidth
+            spacing: 10
 
             LText {
-                id: tuneArchiveDownloadStatus
                 Layout.fillWidth: true
+
+                elide: Text.ElideRight
+                text: shareTuneDialog.tune ? shareTuneDialog.tune.name : ""
+            }
+
+            CheckBox {
+                id: shareFullConfigCheck
+
+                text: "Share complete config (incl. LEDs, faults, BMS)"
+                onCheckedChanged: shareTuneDialog.updateCode()
+            }
+
+            LText {
+                Layout.fillWidth: true
+
+                visible: shareTuneDialog.code === ""
+                font.pointSize: 11
+                wrapMode: Text.WordWrap
+                text: "Connect to a board first - a share code is built from its parameter list."
+            }
+
+            Canvas {
+                id: qrCanvas
                 Layout.alignment: Qt.AlignHCenter
+                Layout.preferredWidth: pixelSize
+                Layout.preferredHeight: pixelSize
+
+                property var symbol: null
+
+                readonly property int quiet: 4
+                // whole pixels per module, else antialiasing stops the symbol from scanning
+                readonly property int moduleSize: symbol
+                    ? Math.max(1, Math.floor(shareTuneDialog.availableWidth / (symbol.size + 2 * quiet)))
+                    : 1
+                readonly property int pixelSize: symbol ? moduleSize * (symbol.size + 2 * quiet) : 1
+
+                visible: symbol !== null
+                contextType: "2d"
+
+                onSymbolChanged: requestPaint()
+
+                onPaint: {
+                    var context = getContext("2d");
+                    context.reset();
+                    // black on white whatever the theme does: scanners refuse inverted symbols
+                    context.fillStyle = "white";
+                    context.fillRect(0, 0, pixelSize, pixelSize);
+                    if (!symbol) {
+                        return;
+                    }
+                    context.fillStyle = "black";
+                    for (var y = 0; y < symbol.size; y++) {
+                        for (var x = 0; x < symbol.size; x++) {
+                            if (symbol.modules[y * symbol.size + x]) {
+                                context.fillRect((x + quiet) * moduleSize, (y + quiet) * moduleSize,
+                                                 moduleSize, moduleSize);
+                            }
+                        }
+                    }
+                }
+            }
+
+            LText {
+                Layout.fillWidth: true
+
+                visible: shareTuneDialog.code !== ""
+                font.pointSize: 11
+                wrapMode: Text.WordWrap
+                text: "Scan it with the phone's camera app, then paste the text into \"Paste Code\" over there."
+            }
+
+            TextArea {
+                id: shareCodeText
+                Layout.fillWidth: true
+                implicitHeight: 90
+
+                visible: shareTuneDialog.code !== ""
+                readOnly: true
+                selectByMouse: true
+                wrapMode: TextEdit.WrapAnywhere
+                font.family: "monospace"
+                font.pointSize: 9
+                text: shareTuneDialog.code
+            }
+
+            Button {
+                Layout.alignment: Qt.AlignRight
+
+                visible: shareTuneDialog.code !== ""
+                text: "Copy"
+                onClicked: {
+                    shareCodeText.selectAll();
+                    shareCodeText.copy();
+                    shareCodeText.deselect();
+                    VescIf.emitStatusMessage("Share code copied", true);
+                }
+            }
+        }
+    }
+
+    BaseDialog {
+        id: importTuneDialog
+        placeAtTop: true
+
+        title: "Paste Tune Code"
+        standardButtons: Dialog.Save | Dialog.Close
+
+        property var decoded: null
+
+        function show() {
+            decoded = null;
+            importCodeText.text = "";
+            importStatus.text = "";
+            importTuneDiff.setModel([]);
+            importTuneDiff.reset();
+            standardButton(Dialog.Save).text = "Add";
+            standardButton(Dialog.Save).enabled = false;
+            open();
+        }
+
+        function parse() {
+            var text = importCodeText.text;
+            var result = text.length >= 10 ? tuneCodec.parseShareCode(text) : null;
+            decoded = result && !result.error ? result : null;
+
+            if (!result) {
+                importStatus.text = "";
+            } else if (result.error) {
+                importStatus.text = result.error;
+            } else {
+                var taken = tuneManager.myTunes.some((tune) => tune && tune.name === result.name);
+                importStatus.text = taken
+                    ? "\"%1\" - a tune of that name is already saved.".arg(result.name)
+                    : "\"%1\" - %2 values.".arg(result.name).arg(Object.keys(result.settings).length);
+            }
+
+            importTuneDiff.setModel(decoded
+                ? packageConfig.diffConfig({"settings": decoded.settings}).differs
+                : []);
+            importTuneDiff.reset();
+            standardButton(Dialog.Save).enabled = decoded !== null;
+        }
+
+        onAccepted: {
+            if (!decoded) {
+                return;
+            }
+            var tune = tuneManager.createTune(decoded.name, "", decoded.settings);
+            tune.source = {"type": "qrshare"};
+            tune.favorite = true;
+            tuneManager.addMyTune(tune);
+            VescIf.emitStatusMessage(decoded.name + " added", true);
+        }
+
+        ColumnLayout {
+            width: importTuneDialog.availableWidth
+            spacing: 10
+
+            LText {
+                Layout.fillWidth: true
 
                 font.pointSize: 11
-                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                text: "Scan the other phone's code with its camera app and paste the text in here."
+            }
+
+            TextArea {
+                id: importCodeText
+                Layout.fillWidth: true
+                implicitHeight: 90
+
+                selectByMouse: true
+                wrapMode: TextEdit.WrapAnywhere
+                font.family: "monospace"
+                font.pointSize: 9
+
+                onTextChanged: importTuneDialog.parse()
+            }
+
+            Button {
+                Layout.alignment: Qt.AlignRight
+
+                text: "Paste"
+                onClicked: {
+                    importCodeText.selectAll();
+                    importCodeText.paste();
+                }
+            }
+
+            LText {
+                id: importStatus
+                Layout.fillWidth: true
+
+                visible: !!text
+                font.pointSize: 11
                 wrapMode: Text.WordWrap
             }
 
-            ListView {
-                id: tuneArchiveTunesList
+            ConfigDiff {
+                id: importTuneDiff
                 Layout.fillWidth: true
-                Layout.fillHeight: true
-                Layout.alignment: Qt.AlignHCenter
-                spacing: 10
+                dialog: importTuneDialog
+                isTune: true
+            }
+        }
+    }
+
+    BaseDialog {
+        id: tuneLibraryDialog
+        implicitHeight: fullHeight
+        clip: true
+
+        title: "Tune Library"
+        standardButtons: Dialog.Close
+
+        function show(tab) {
+            tuneLibraryTabBar.currentIndex = tab || 0;
+            open();
+            // the first page is already visible, so its onVisibleChanged never fires
+            var page = tuneLibraryStackLayout.children[tuneLibraryStackLayout.currentIndex];
+            if (page.ensureLoaded) {
+                page.ensureLoaded();
+            }
+        }
+
+        component TuneListItem : Rectangle {
+            id: listItem
+
+            property string name
+            property string subtitle
+            property var categories: []
+            property string description
+            property bool favorite: false
+            property bool editable: false
+            property bool matches: false
+            // set by the delegate: the tune object only exists there
+            property bool shareable: false
+
+            signal clicked()
+            signal held()
+            signal favoriteToggled()
+            signal shared()
+
+            readonly property string starSvg: "M 25 6 L 29.7 19.5 L 44 19.8 L 32.6 28.5 L 36.8 42.2 L 25 34 L 13.2 42.2 L 17.4 28.5 L 6 19.8 L 20.3 19.5 Z"
+
+            implicitHeight: listItemLayout.implicitHeight + 0.4 * unit
+            radius: 3
+            border.width: 2
+            border.color: listItem.matches ? Utility.getAppHexColor("lightAccent") : Utility.getAppHexColor("lightText")
+            color: listItemMouseArea.pressed
+                ? Utility.getAppHexColor("lightestBackground")
+                : Utility.getAppHexColor("normalBackground")
+
+            MouseArea {
+                id: listItemMouseArea
+                anchors.fill: parent
+                onClicked: listItem.clicked()
+                onPressAndHold: listItem.held()
+            }
+
+            Glow {
+                anchors.fill: parent
+                radius: Math.round(0.25 * unit)
+                samples: radius * 2 + 1
+                opacity: 0.3
+                color: Utility.getAppHexColor("lightAccent")
+                visible: listItem.matches
+                source: listItem
+            }
+
+            RowLayout {
+                id: listItemLayout
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: 0.3 * unit
+                anchors.rightMargin: 0.15 * unit
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 2
+
+                    LText {
+                        Layout.fillWidth: true
+                        text: listItem.name
+                        elide: Text.ElideRight
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        visible: !!listItem.subtitle
+                        font.pixelSize: fontSizeSuperSmall
+                        text: listItem.subtitle
+                        elide: Text.ElideRight
+                    }
+
+                    Row {
+                        spacing: 4
+                        visible: listItem.categories.length > 0
+
+                        Repeater {
+                            model: listItem.categories
+
+                            Rectangle {
+                                radius: height / 2
+                                color: Utility.getAppHexColor("lightBackground")
+                                implicitHeight: badgeText.implicitHeight + 4
+                                implicitWidth: badgeText.implicitWidth + 12
+
+                                DText {
+                                    id: badgeText
+                                    anchors.centerIn: parent
+                                    font.pixelSize: fontSizeSuperSmall
+                                    text: modelData
+                                }
+                            }
+                        }
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        visible: !!listItem.description
+                        font.pixelSize: fontSizeSuperSmall
+                        wrapMode: Text.WordWrap
+                        elide: Text.ElideRight
+                        maximumLineCount: 2
+                        text: listItem.description
+                    }
+                }
+
+                FloatingToolButton {
+                    visible: listItem.shareable
+                    size: 0.9 * unit
+                    Layout.preferredWidth: size
+                    Layout.preferredHeight: size
+                    bgColor: Utility.getAppHexColor("normalBackground")
+
+                    // three corner squares and a few loose modules: a QR symbol
+                    iconPath: Path {
+                        PathSvg {path: "M 12 12 L 22 12 L 22 22 L 12 22 Z M 28 12 L 38 12 L 38 22 L 28 22 Z M 12 28 L 22 28 L 22 38 L 12 38 Z M 28 28 L 32 28 M 34 33 L 38 33 M 28 38 L 33 38"}
+                    }
+
+                    onClicked: listItem.shared()
+                }
+
+                FloatingToolButton {
+                    visible: listItem.editable
+                    size: 0.9 * unit
+                    Layout.preferredWidth: size
+                    Layout.preferredHeight: size
+                    bgColor: Utility.getAppHexColor("normalBackground")
+
+                    iconPath: Path {
+                        PathSvg {path: "M 12 38 L 14 30 L 34 10 L 40 16 L 20 36 L 12 38 M 14 30 L 20 36"}
+                    }
+
+                    onClicked: listItem.held()
+                }
+
+                ToggleFloatingToolButton {
+                    autonomous: false
+                    value: listItem.favorite
+                    size: 0.9 * unit
+                    Layout.preferredWidth: size
+                    Layout.preferredHeight: size
+                    bgColor: Utility.getAppHexColor("normalBackground")
+                    fillColor: Utility.getAppHexColor("lightAccent")
+
+                    falseIconPath: Path { PathSvg {path: listItem.starSvg} }
+                    trueIconPath: Path { PathSvg {path: listItem.starSvg} }
+                    trueFillIconPath: Path { PathSvg {path: listItem.starSvg} }
+
+                    onClicked: listItem.favoriteToggled()
+                }
+            }
+        }
+
+        ColumnLayout {
+            width: tuneLibraryDialog.availableWidth
+            height: parent.height
+
+            TabBar {
+                id: tuneLibraryTabBar
+                Layout.fillWidth: true
                 clip: true
 
-                model: ListModel {
-                    id: downloadedTunesModel
+                Repeater {
+                    model: ["Refloat Archive", "My Tunes"]
 
-                    function setTunes(tunes) {
-                        clear();
-                        for (var i in tunes) {
-                            append({"tune": tunes[i]});
+                    TabButton {
+                        text: modelData
+                    }
+                }
+
+                background: Rectangle {
+                    opacity: 1
+                    color: Utility.getAppHexColor("lightBackground");
+                }
+
+                onCurrentIndexChanged: {
+                    tuneLibraryStackLayout.currentIndex = currentIndex;
+                }
+            }
+
+            StackLayout {
+                id: tuneLibraryStackLayout
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+
+                ColumnLayout {
+                    id: refloatArchivePage
+                    spacing: 15
+
+                    property bool loaded: false
+
+                    onVisibleChanged: {
+                        if (visible) {
+                            ensureLoaded();
+                        }
+                    }
+
+                    function ensureLoaded() {
+                        if (!loaded) {
+                            loaded = true;
+                            refresh(false);
+                        }
+                    }
+
+                    function refresh(force) {
+                        var tuneArchive = force ? null : tuneManager.loadTuneArchive();
+                        // backwards compatibility: Check for the first item settings not being an array (if it is, redownload)
+                        if (tuneArchive && tuneArchive.length > 0 && !Array.isArray(tuneArchive[0].settings)) {
+                            refloatArchiveModel.setTunes(tuneArchive);
+                            refloatArchiveStatus.text = "Tunes downloaded on %1".arg(tuneManager.getTuneArchiveDate());
+                        } else {
+                            download();
+                        }
+                    }
+
+                    function download() {
+                        refloatArchiveStatus.text = "Downloading tunes...";
+                        var http = new XMLHttpRequest();
+                        var url = "http://us-central1-mimetic-union-377520.cloudfunctions.net/float_package_tunes_via_http";
+                        http.open("GET", url, true);
+                        http.onreadystatechange = function() {
+                            if (http.readyState === XMLHttpRequest.DONE) {
+                                if (http.status === 200) {
+                                    refloatArchiveStatus.text = "Download succesful.";
+
+                                    var tunes = tuneManager.parseCsv(http.responseText);
+                                    tuneManager.saveTuneArchive(tunes);
+                                    refloatArchiveModel.setTunes(tunes);
+                                } else if (http.status === 0) {
+                                    refloatArchiveStatus.text = "Download failed: Connection error";
+                                } else {
+                                    refloatArchiveStatus.text = "Download failed: %1 - %2".arg(http.status).arg(http.statusText);
+                                }
+                            }
+
+                        };
+
+                        http.send();
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        LText {
+                            id: refloatArchiveStatus
+                            Layout.fillWidth: true
+
+                            font.pointSize: 11
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Button {
+                            text: "Refresh"
+                            onClicked: refloatArchivePage.download()
+                        }
+                    }
+
+                    ListView {
+                        id: refloatArchiveList
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 10
+                        clip: true
+
+                        model: ListModel {
+                            id: refloatArchiveModel
+
+                            function setTunes(tunes) {
+                                clear();
+                                for (var i in tunes) {
+                                    append({"tune": tunes[i]});
+                                }
+                            }
+                        }
+
+                        delegate: TuneListItem {
+                            width: refloatArchiveList.width
+
+                            property var tune: model.tune
+                            property var favoriteEntry: tuneManager.findMyTuneBySource({"type": "refloat-archive", "name": tune.name})
+                            matches: tune ? tuneManager.tuneMatches(tune) : false
+
+                            name: tune.name
+                            favorite: favoriteEntry ? !!favoriteEntry.favorite : false
+
+                            onClicked: {
+                                applyConfigDialog.show(tune, false, true);
+                            }
+
+                            onFavoriteToggled: {
+                                if (favoriteEntry) {
+                                    tuneManager.setFavorite(favoriteEntry.uuid, !favoriteEntry.favorite);
+                                } else {
+                                    var snapshot = JSON.parse(JSON.stringify(tune));
+                                    snapshot.date = new Date();
+                                    snapshot.package = {"name": tuneManager.packageName, "version": tuneManager.packageVersion};
+                                    snapshot.source = {"type": "refloat-archive"};
+                                    snapshot.favorite = true;
+                                    tuneManager.addMyTune(snapshot);
+                                }
+                            }
                         }
                     }
                 }
 
-                delegate: Button {
-                    width: tuneArchiveTunesList.width
-                    text: tune.name
-                    onClicked: {
-                        applyConfigDialog.show(tune, false, true);
+                ColumnLayout {
+                    id: myTunesPage
+                    spacing: 15
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 15
+
+                        LText {
+                            Layout.fillWidth: true
+
+                            font.pointSize: 11
+                            wrapMode: Text.WordWrap
+                            text: "Share a tune with the code button next to it."
+                        }
+
+                        Button {
+                            text: "Paste Code"
+                            onClicked: importTuneDialog.show()
+                        }
+                    }
+
+                    ListView {
+                        id: myTunesList
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 10
+                        clip: true
+                        visible: tuneManager.myTunes.length > 0
+
+                        model: tuneManager.myTunes.length
+
+                        delegate: TuneListItem {
+                            width: myTunesList.width
+
+                            property var tune: tuneManager.myTunes[index]
+                            matches: tune ? tuneManager.tuneMatches(tune) : false
+
+                            name: tune ? tune.name : ""
+                            // Never empty: a hidden subtitle drops a child out of the row layout and
+                            // TuneListItem's height then oscillates (binding loop).
+                            subtitle: {
+                                if (!tune) {
+                                    return "";
+                                }
+                                var parts = [];
+                                if (tune.date) {
+                                    parts.push(Qt.formatDateTime(new Date(tune.date)));
+                                }
+                                if (tune.source && tune.source.type === "refloat-archive") {
+                                    parts.push("Refloat Archive");
+                                }
+                                if (parts.length === 0) {
+                                    parts.push("Local");
+                                }
+                                return parts.join(" · ");
+                            }
+                            favorite: tune ? !!tune.favorite : false
+                            editable: true
+                            // archive tunes carry Float names, a code from them would arrive near empty
+                            shareable: tune ? (!tune.source || tune.source.type === "local"
+                                               || tune.source.type === "qrshare") : false
+
+                            onClicked: {
+                                applyConfigDialog.show(tune, false, true);
+                            }
+
+                            onHeld: {
+                                editTuneDialog.show(tune.uuid);
+                            }
+
+                            onFavoriteToggled: {
+                                tuneManager.setFavorite(tune.uuid, !tune.favorite);
+                            }
+
+                            onShared: {
+                                shareTuneDialog.show(tune);
+                            }
+                        }
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        Layout.margins: 20
+                        visible: tuneManager.myTunes.length === 0
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                        wrapMode: Text.WordWrap
+                        text: "No tunes saved yet. Use \"Pull and Save from board\" or favorite tunes from the archives."
                     }
                 }
             }
@@ -5735,7 +7418,8 @@ Item {
         property BaseDialog dialog
         property bool isTune: false
 
-        property bool isEmpty: diffModel.count === 0
+        property bool isEmpty: diffCount === 0
+        property int diffCount: 0
 
         property real rowHeight: 30
         property real valueColumnWidth: 60
@@ -5787,14 +7471,32 @@ Item {
         function setModel(m) {
             var model = diffModel;
             model.clear();
-            var empty = true;
+            var count = 0;
+            var lastGroup = null;
+            var groupRow = 0;
             for (var item of m) {
+                if (item.group !== lastGroup) {
+                    model.append({
+                        "isHeader": true,
+                        "name": item.group,
+                        "value": "",
+                        "otherValue": "",
+                        "alt": false
+                    });
+                    lastGroup = item.group;
+                    groupRow = 0;
+                }
+                item.isHeader = false;
+                // alternate row colors per group, headers break the index parity
+                item.alt = groupRow % 2 === 1;
                 item.value = displayValue(item, item.value);
                 item.otherValue = displayValue(item, item.otherValue);
                 model.append(item);
-                empty = false;
+                count++;
+                groupRow++;
             }
-            if (empty) {
+            diffCount = count;
+            if (count === 0) {
                 diffCheckbox.checked = false;
             }
         }
@@ -5820,7 +7522,7 @@ Item {
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.leftMargin: 22
-                    text: "Differences (%1)".arg(diffModel.count)
+                    text: "Differences (%1)".arg(configDiff.diffCount)
                     color: Utility.getAppHexColor("lightText")
                     verticalAlignment: Text.AlignVCenter
                 }
@@ -5897,13 +7599,26 @@ Item {
                 }
 
                 delegate: Rectangle {
-                    color: index % 2 === 0 ? Utility.getAppHexColor("lightBackground") : Utility.getAppHexColor("normalBackground")
+                    color: isHeader
+                        ? Utility.getAppHexColor("lightestBackground")
+                        : alt ? Utility.getAppHexColor("normalBackground") : Utility.getAppHexColor("lightBackground")
                     implicitWidth: diffView.width
                     implicitHeight: rowHeight
+
+                    NText {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 5
+                        height: rowHeight
+                        visible: isHeader
+                        verticalAlignment: Text.AlignVCenter
+                        text: isHeader ? name : ""
+                        color: Utility.getAppHexColor("lightAccent")
+                    }
 
                     Row {
                         id: diffRow
                         anchors.centerIn: parent
+                        visible: !isHeader
 
                         NText {
                             width: diffView.width - 2 * valueColumnWidth - 10
@@ -5913,7 +7628,7 @@ Item {
                             wrapMode: Text.WordWrap
                             fontSizeMode: Text.Fit
                             minimumPointSize: 4
-                            text: packageConfig.getDisplayName(name)
+                            text: isHeader ? "" : packageConfig.getDisplayName(name)
                             color: Utility.getAppHexColor("lightText")
                         }
 
@@ -6006,9 +7721,11 @@ Item {
         }
 
         onApplied: {
-            packageConfig.applyConfig(config);
+            if (packageConfig.applyConfig(config) && isTune) {
+                tuneManager.setCurrentTune(config);
+            }
             close();
-            tuneArchiveDialog.close();
+            tuneLibraryDialog.close();
         }
 
         // "Keep Defaults" — uses RejectRole for middle position on Android
@@ -7521,138 +9238,268 @@ Item {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
-                GridLayout {
-                    property int spacing: 0.6 * unit
-                    anchors.fill: parent
-                    anchors.topMargin: spacing
-                    anchors.leftMargin: spacing
-                    anchors.rightMargin: spacing
-                    anchors.bottomMargin: spacing - bottomLine.height - root.spacing
-                    rowSpacing: spacing
-                    columnSpacing: spacing
-                    columns: (preferences.tuneSlotCount === 2 && height > width * 0.6) ? 1 : 2
+                RowLayout {
+                    id: currentTuneRow
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.topMargin: 0.3 * unit
+                    anchors.leftMargin: 0.6 * unit
+                    // leave room for the FAB
+                    anchors.rightMargin: 1.5 * unit
+                    spacing: 0.2 * unit
 
-                    Repeater {
-                        model: preferences.tuneSlotCount
+                    LText {
+                        text: "Tune:"
+                    }
 
-                        Button {
-                            id: button
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            Layout.minimumHeight: buttonItemHeight + 2 * buttonItemMargin
-                            Layout.columnSpan: (slot === preferences.tuneSlotCount && (slot % 2) === 1) ? 2 : 1
+                    NText {
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                        text: tuneManager.currentTune ? tuneManager.currentTune.name : "None"
+                        color: tuneManager.currentTune ? Utility.getAppHexColor("lightText") : Utility.getAppHexColor("disabledText")
+                    }
 
-                            property int slot: index + 1
+                    DText {
+                        property int diff: tuneManager.currentTune ? packageConfig.diffConfig(tuneManager.currentTune).differs.length : 0
 
-                            property var tuneName: tuneManager.tunes[slot] ? tuneManager.tunes[slot].name : ""
-                            property var tuneDiff: tuneManager.tunes[slot] ? packageConfig.diffConfig(tuneManager.tunes[slot]).differs.length : -1
+                        font.pixelSize: fontSizeSmall
+                        visible: diff > 0
+                        text: preferences.showTuneDiffCount ? "modified (%1)".arg(diff) : "modified"
+                    }
+                }
 
-                            property real buttonItemHeight: unit
-                            property real buttonItemMargin: 0.15 * unit
+                ScrollView {
+                    id: tunesScroll
+                    anchors.top: currentTuneRow.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.topMargin: 0.3 * unit
+                    anchors.bottomMargin: -bottomLine.height - root.spacing
+                    clip: true
+                    contentWidth: availableWidth
+                    // Not bound to tunesGrid.implicitHeight: tunesGrid is this ScrollView's
+                    // content item, so binding back to it is a loop. Same value from the rows.
+                    contentHeight: tunesGrid.rowCount * tunesGrid.rowHeight
+                        + tunesGrid.separatorCount * (tunesGrid.separatorHeight + tunesGrid.gridSpacing)
+                        + (tunesGrid.rowCount + 1) * tunesGrid.gridSpacing
+                    visible: tuneManager.favoriteTunes.length > 0
 
-                            padding: 0
-                            leftInset: 0
-                            rightInset: 0
-                            topInset: 0
-                            bottomInset: 0
+                    GridLayout {
+                        id: tunesGrid
+                        // gridSpacing, not spacing: redeclaring spacing would shadow GridLayout's
+                        // own, which rowSpacing/columnSpacing are set from.
+                        property int gridSpacing: 0.6 * unit
+                        property real separatorHeight: 0.7 * unit
 
-                            onPressAndHold: {
-                                editTuneDialog.show(slot, tuneName);
-                            }
-
-                            onClicked: {
-                                if (tuneName) {
-                                    var tune = tuneManager.loadTune(slot);
-                                    packageConfig.applyConfig(tune);
+                        // Board favorites first under their own heading, then the rest - headings
+                        // and tunes share one Repeater. No board favorites, no heading.
+                        readonly property var entries: {
+                            var list = [];
+                            var boardGroup = tuneManager.boardTunes;
+                            var rest = tuneManager.otherTunes;
+                            var addGroup = function(tunes) {
+                                for (var i = 0; i < tunes.length; i++) {
+                                    list.push({"tune": tunes[i], "separator": "",
+                                               "wide": i === tunes.length - 1 && tunes.length % 2 === 1});
+                                }
+                            };
+                            if (boardGroup.length > 0) {
+                                list.push({"tune": null, "separator": "This Board", "wide": true});
+                                addGroup(boardGroup);
+                                if (rest.length > 0) {
+                                    list.push({"tune": null, "separator": "Other Favorites", "wide": true});
                                 }
                             }
+                            addGroup(rest);
+                            return list;
+                        }
+                        readonly property int separatorCount: entries.filter((entry) => !!entry.separator).length
 
-                            contentItem: Item {
-                                anchors.fill: parent
-                                anchors.margins: parent.buttonItemMargin
-                                clip: true
-                                z: 2
+                        // fill the page while the tunes fit, scroll beyond that
+                        property real rowCount: Math.max(1,
+                            Math.ceil(tuneManager.boardTunes.length / columns)
+                            + Math.ceil(tuneManager.otherTunes.length / columns))
+                        property real rowHeight: Math.max(1.4 * unit,
+                            (tunesScroll.availableHeight
+                             - separatorCount * (separatorHeight + gridSpacing)
+                             - (rowCount + 1) * gridSpacing) / rowCount)
 
-                                Item {
-                                    anchors.centerIn: parent
-                                    width: parent.width
-                                    height: button.buttonItemHeight
+                        width: tunesScroll.availableWidth - 2 * gridSpacing
+                        x: gridSpacing
+                        y: gridSpacing
+                        rowSpacing: gridSpacing
+                        columnSpacing: gridSpacing
+                        // two tunes in one column would put the separator between them
+                        columns: (separatorCount === 0 && tuneManager.favoriteTunes.length === 2
+                                  && tunesPage.height > tunesPage.width * 0.6) ? 1 : 2
 
-                                    Text {
-                                        id: tuneButtonText
-                                        width: parent.width
-                                        anchors.centerIn: tuneName ? parent : undefined
-                                        anchors.top: tuneName ? undefined : parent.top
+                        Repeater {
+                            // The count, not the array: Repeater.setModel() compares by value and
+                            // skips the rebuild, leaving stale diffs on the delegates.
+                            model: tunesGrid.entries.length
 
-                                        color: tuneName ? Utility.getAppHexColor("lightText") : Utility.getAppHexColor("disabledText")
-                                        font.pixelSize: 0.5 * unit
-                                        horizontalAlignment: Text.AlignHCenter
-                                        wrapMode: Text.WordWrap
-                                        text: tuneName || "empty slot"
-                                    }
+                            // the wrapper carries the layout attachments: tune button or separator
+                            Item {
+                                id: entryItem
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: separator
+                                    ? tunesGrid.separatorHeight : tunesGrid.rowHeight
+                                Layout.columnSpan: tunesGrid.columns === 2 && entry && entry.wide ? 2 : 1
 
-                                    DText {
-                                        id: tuneButtonHelpText
-                                        width: parent.width
-                                        anchors.bottom: parent.bottom
-
-                                        font.pixelSize: fontSizeSuperSmall
-                                        visible: !tuneName
-                                        horizontalAlignment: Text.AlignHCenter
-                                        text: "press and hold to set"
-                                    }
-                                }
+                                // delegates outlive their entry by one evaluation while the grid shrinks
+                                property var entry: tunesGrid.entries[index]
+                                property string separator: entry ? entry.separator : ""
 
                                 DText {
-                                    id: tuneButtonDiffCount
-                                    anchors.bottom: parent.bottom
+                                    anchors.left: parent.left
                                     anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
 
+                                    visible: !!entryItem.separator
                                     font.pixelSize: fontSizeSmall
-                                    visible: preferences.showTuneDiffCount && tuneDiff > 0
-                                    horizontalAlignment: Text.AlignHRight
-                                    text: tuneDiff
+                                    text: entryItem.separator
                                 }
-                            }
 
-                            background: Rectangle {
-                                id: buttonBg
-                                z: 1
+                                Button {
+                                    id: button
+                                    anchors.fill: parent
 
-                                border.color: tuneDiff === 0 ? Utility.getAppHexColor("lightAccent") : tuneName ? Utility.getAppHexColor("lightText") : Utility.getAppHexColor("disabledText")
-                                border.width: 2
-                                radius: 3
+                                    // contentItem/background hang off the wrapper, not off this Button
+                                    visible: !entryItem.separator
 
-                                color: Utility.getAppHexColor("normalBackground")
+                                    property var tune: entryItem.entry ? entryItem.entry.tune : null
 
-                                states: [
-                                    State {
-                                        name: "change"
-                                        when: button.pressed
-                                        PropertyChanges {target: buttonBg; color: Utility.getAppHexColor("lightestBackground");}
+                                    property var tuneName: tune ? tune.name : ""
+                                    property var tuneDiff: tune ? packageConfig.diffConfig(tune).differs.length : -1
+
+                                    property real buttonItemHeight: unit
+                                    property real buttonItemMargin: 0.15 * unit
+
+                                    padding: 0
+                                    leftInset: 0
+                                    rightInset: 0
+                                    topInset: 0
+                                    bottomInset: 0
+
+                                    onPressAndHold: {
+                                        if (tune) {
+                                            editTuneDialog.show(tune.uuid);
+                                        }
                                     }
-                                ]
 
-                                transitions: Transition {
-                                    ColorAnimation {property: "color"; duration: 200; easing.type: Easing.InOutCirc;}
+                                    onClicked: {
+                                        if (tune && packageConfig.applyConfig(tune)) {
+                                            tuneManager.setCurrentTune(tune);
+                                        }
+                                    }
+
+                                    contentItem: Item {
+                                        anchors.fill: parent
+                                        anchors.margins: parent.buttonItemMargin
+                                        clip: true
+                                        z: 2
+
+                                        Item {
+                                            anchors.centerIn: parent
+                                            width: parent.width
+                                            height: button.buttonItemHeight
+
+                                            Text {
+                                                id: tuneButtonText
+                                                width: parent.width
+                                                anchors.centerIn: parent
+
+                                                color: Utility.getAppHexColor("lightText")
+                                                font.pixelSize: 0.5 * unit
+                                                horizontalAlignment: Text.AlignHCenter
+                                                wrapMode: Text.WordWrap
+                                                text: button.tuneName
+                                            }
+                                        }
+
+                                        DText {
+                                            id: tuneButtonDiffCount
+                                            anchors.bottom: parent.bottom
+                                            anchors.right: parent.right
+
+                                            font.pixelSize: fontSizeSmall
+                                            visible: preferences.showTuneDiffCount && button.tuneDiff > 0
+                                            horizontalAlignment: Text.AlignHRight
+                                            text: button.tuneDiff
+                                        }
+                                    }
+
+                                    background: Rectangle {
+                                        id: buttonBg
+                                        z: 1
+
+                                        border.color: button.tuneDiff === 0 ? Utility.getAppHexColor("lightAccent") : Utility.getAppHexColor("lightText")
+                                        border.width: 2
+                                        radius: 3
+
+                                        color: Utility.getAppHexColor("normalBackground")
+
+                                        states: [
+                                            State {
+                                                name: "change"
+                                                when: button.pressed
+                                                PropertyChanges {target: buttonBg; color: Utility.getAppHexColor("lightestBackground");}
+                                            }
+                                        ]
+
+                                        transitions: Transition {
+                                            ColorAnimation {property: "color"; duration: 200; easing.type: Easing.InOutCirc;}
+                                        }
+                                    }
+
+                                    Glow {
+                                        anchors.fill: buttonBg
+                                        radius: Math.round(0.25 * unit)
+                                        samples: radius * 2 + 1
+                                        opacity: 0.3
+                                        color: Utility.getAppHexColor("lightAccent")
+                                        visible: button.tuneDiff === 0
+                                        source: buttonBg
+                                    }
                                 }
-                            }
-
-                            Glow {
-                                anchors.fill: buttonBg
-                                radius: Math.round(0.25 * unit)
-                                samples: radius * 2 + 1
-                                opacity: 0.3
-                                color: Utility.getAppHexColor("lightAccent")
-                                visible: tuneDiff === 0
-                                source: buttonBg
                             }
                         }
                     }
                 }
 
+                ColumnLayout {
+                    anchors.centerIn: parent
+                    width: parent.width * 0.8
+                    visible: tuneManager.favoriteTunes.length === 0
+                    spacing: 0.3 * unit
+
+                    NText {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        text: "No favorite tunes"
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: fontSizeSmall
+                        text: "Pull the tune from your board or star tunes in the Tune Library"
+                    }
+
+                    Button {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: "Open Tune Library"
+                        onClicked: {
+                            tuneLibraryDialog.show(0);
+                        }
+                    }
+                }
+
                 FloatingToolButton {
-                    id: downloadTunesButton
+                    id: tunesMenuButton
                     anchors.right: parent.right
                     anchors.top: parent.top
                     size: unit
@@ -7662,7 +9509,27 @@ Item {
                     }
 
                     onClicked: {
-                        tuneArchiveDialog.show();
+                        tunesFabMenu.visible = true;
+                    }
+
+                    Menu {
+                        id: tunesFabMenu
+                        x: parent.width - width
+                        y: parent.height
+
+                        MenuItem {
+                            text: "Tune Library"
+                            onTriggered: {
+                                tuneLibraryDialog.show(0);
+                            }
+                        }
+
+                        MenuItem {
+                            text: "Pull and Save from board"
+                            onTriggered: {
+                                editTuneDialog.show(null);
+                            }
+                        }
                     }
                 }
             }
