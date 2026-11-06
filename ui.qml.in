@@ -5642,6 +5642,383 @@ Item {
     }
 
     BaseDialog {
+        id: tuneLibraryDialog
+        implicitHeight: fullHeight
+        clip: true
+
+        title: "Tune Library"
+        standardButtons: Dialog.Close
+
+        function show(tab) {
+            tuneLibraryTabBar.currentIndex = tab || 0;
+            open();
+            // the first page is already visible, so its onVisibleChanged never fires
+            var page = tuneLibraryStackLayout.children[tuneLibraryStackLayout.currentIndex];
+            if (page.ensureLoaded) {
+                page.ensureLoaded();
+            }
+        }
+
+        component TuneListItem : Rectangle {
+            id: listItem
+
+            property string name
+            property string subtitle
+            property var categories: []
+            property string description
+            property bool favorite: false
+            property bool editable: false
+            property bool matches: false
+
+            signal clicked()
+            signal held()
+            signal favoriteToggled()
+
+            readonly property string starSvg: "M 25 6 L 29.7 19.5 L 44 19.8 L 32.6 28.5 L 36.8 42.2 L 25 34 L 13.2 42.2 L 17.4 28.5 L 6 19.8 L 20.3 19.5 Z"
+
+            implicitHeight: listItemLayout.implicitHeight + 0.4 * unit
+            radius: 3
+            border.width: 2
+            border.color: listItem.matches ? Utility.getAppHexColor("lightAccent") : Utility.getAppHexColor("lightText")
+            color: listItemMouseArea.pressed
+                ? Utility.getAppHexColor("lightestBackground")
+                : Utility.getAppHexColor("normalBackground")
+
+            MouseArea {
+                id: listItemMouseArea
+                anchors.fill: parent
+                onClicked: listItem.clicked()
+                onPressAndHold: listItem.held()
+            }
+
+            Glow {
+                anchors.fill: parent
+                radius: Math.round(0.25 * unit)
+                samples: radius * 2 + 1
+                opacity: 0.3
+                color: Utility.getAppHexColor("lightAccent")
+                visible: listItem.matches
+                source: listItem
+            }
+
+            RowLayout {
+                id: listItemLayout
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.leftMargin: 0.3 * unit
+                anchors.rightMargin: 0.15 * unit
+
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    spacing: 2
+
+                    LText {
+                        Layout.fillWidth: true
+                        text: listItem.name
+                        elide: Text.ElideRight
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        visible: !!listItem.subtitle
+                        font.pixelSize: fontSizeSuperSmall
+                        text: listItem.subtitle
+                        elide: Text.ElideRight
+                    }
+
+                    Row {
+                        spacing: 4
+                        visible: listItem.categories.length > 0
+
+                        Repeater {
+                            model: listItem.categories
+
+                            Rectangle {
+                                radius: height / 2
+                                color: Utility.getAppHexColor("lightBackground")
+                                implicitHeight: badgeText.implicitHeight + 4
+                                implicitWidth: badgeText.implicitWidth + 12
+
+                                DText {
+                                    id: badgeText
+                                    anchors.centerIn: parent
+                                    font.pixelSize: fontSizeSuperSmall
+                                    text: modelData
+                                }
+                            }
+                        }
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        visible: !!listItem.description
+                        font.pixelSize: fontSizeSuperSmall
+                        wrapMode: Text.WordWrap
+                        elide: Text.ElideRight
+                        maximumLineCount: 2
+                        text: listItem.description
+                    }
+                }
+
+                FloatingToolButton {
+                    visible: listItem.editable
+                    size: 0.9 * unit
+                    Layout.preferredWidth: size
+                    Layout.preferredHeight: size
+                    bgColor: Utility.getAppHexColor("normalBackground")
+
+                    iconPath: Path {
+                        PathSvg {path: "M 12 38 L 14 30 L 34 10 L 40 16 L 20 36 L 12 38 M 14 30 L 20 36"}
+                    }
+
+                    onClicked: listItem.held()
+                }
+
+                ToggleFloatingToolButton {
+                    autonomous: false
+                    value: listItem.favorite
+                    size: 0.9 * unit
+                    Layout.preferredWidth: size
+                    Layout.preferredHeight: size
+                    bgColor: Utility.getAppHexColor("normalBackground")
+                    fillColor: Utility.getAppHexColor("lightAccent")
+
+                    falseIconPath: Path { PathSvg {path: listItem.starSvg} }
+                    trueIconPath: Path { PathSvg {path: listItem.starSvg} }
+                    trueFillIconPath: Path { PathSvg {path: listItem.starSvg} }
+
+                    onClicked: listItem.favoriteToggled()
+                }
+            }
+        }
+
+        ColumnLayout {
+            width: tuneLibraryDialog.availableWidth
+            height: parent.height
+
+            TabBar {
+                id: tuneLibraryTabBar
+                Layout.fillWidth: true
+                clip: true
+
+                Repeater {
+                    model: ["Refloat Archive", "My Tunes"]
+
+                    TabButton {
+                        text: modelData
+                    }
+                }
+
+                background: Rectangle {
+                    opacity: 1
+                    color: Utility.getAppHexColor("lightBackground");
+                }
+
+                onCurrentIndexChanged: {
+                    tuneLibraryStackLayout.currentIndex = currentIndex;
+                }
+            }
+
+            StackLayout {
+                id: tuneLibraryStackLayout
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+
+                ColumnLayout {
+                    id: refloatArchivePage
+                    spacing: 15
+
+                    property bool loaded: false
+
+                    onVisibleChanged: {
+                        if (visible) {
+                            ensureLoaded();
+                        }
+                    }
+
+                    function ensureLoaded() {
+                        if (!loaded) {
+                            loaded = true;
+                            refresh(false);
+                        }
+                    }
+
+                    function refresh(force) {
+                        var tuneArchive = force ? null : tuneManager.loadTuneArchive();
+                        // backwards compatibility: Check for the first item settings not being an array (if it is, redownload)
+                        if (tuneArchive && tuneArchive.length > 0 && !Array.isArray(tuneArchive[0].settings)) {
+                            refloatArchiveModel.setTunes(tuneArchive);
+                            refloatArchiveStatus.text = "Tunes downloaded on %1".arg(tuneManager.getTuneArchiveDate());
+                        } else {
+                            download();
+                        }
+                    }
+
+                    function download() {
+                        refloatArchiveStatus.text = "Downloading tunes...";
+                        var http = new XMLHttpRequest();
+                        var url = "http://us-central1-mimetic-union-377520.cloudfunctions.net/float_package_tunes_via_http";
+                        http.open("GET", url, true);
+                        http.onreadystatechange = function() {
+                            if (http.readyState === XMLHttpRequest.DONE) {
+                                if (http.status === 200) {
+                                    refloatArchiveStatus.text = "Download succesful.";
+
+                                    var tunes = tuneManager.parseCsv(http.responseText);
+                                    tuneManager.saveTuneArchive(tunes);
+                                    refloatArchiveModel.setTunes(tunes);
+                                } else if (http.status === 0) {
+                                    refloatArchiveStatus.text = "Download failed: Connection error";
+                                } else {
+                                    refloatArchiveStatus.text = "Download failed: %1 - %2".arg(http.status).arg(http.statusText);
+                                }
+                            }
+
+                        };
+
+                        http.send();
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+
+                        LText {
+                            id: refloatArchiveStatus
+                            Layout.fillWidth: true
+
+                            font.pointSize: 11
+                            horizontalAlignment: Text.AlignHCenter
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Button {
+                            text: "Refresh"
+                            onClicked: refloatArchivePage.download()
+                        }
+                    }
+
+                    ListView {
+                        id: refloatArchiveList
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 10
+                        clip: true
+
+                        model: ListModel {
+                            id: refloatArchiveModel
+
+                            function setTunes(tunes) {
+                                clear();
+                                for (var i in tunes) {
+                                    append({"tune": tunes[i]});
+                                }
+                            }
+                        }
+
+                        delegate: TuneListItem {
+                            width: refloatArchiveList.width
+
+                            property var tune: model.tune
+                            property var favoriteEntry: tuneManager.findMyTuneBySource({"type": "refloat-archive", "name": tune.name})
+                            matches: tune ? tuneManager.tuneMatches(tune) : false
+
+                            name: tune.name
+                            favorite: favoriteEntry ? !!favoriteEntry.favorite : false
+
+                            onClicked: {
+                                applyConfigDialog.show(tune, false, true);
+                            }
+
+                            onFavoriteToggled: {
+                                if (favoriteEntry) {
+                                    tuneManager.setFavorite(favoriteEntry.uuid, !favoriteEntry.favorite);
+                                } else {
+                                    var snapshot = JSON.parse(JSON.stringify(tune));
+                                    snapshot.date = new Date();
+                                    snapshot.package = {"name": tuneManager.packageName, "version": tuneManager.packageVersion};
+                                    snapshot.source = {"type": "refloat-archive"};
+                                    snapshot.favorite = true;
+                                    tuneManager.addMyTune(snapshot);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ColumnLayout {
+                    id: myTunesPage
+                    spacing: 15
+
+                    ListView {
+                        id: myTunesList
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        spacing: 10
+                        clip: true
+                        visible: tuneManager.myTunes.length > 0
+
+                        model: tuneManager.myTunes.length
+
+                        delegate: TuneListItem {
+                            width: myTunesList.width
+
+                            property var tune: tuneManager.myTunes[index]
+                            matches: tune ? tuneManager.tuneMatches(tune) : false
+
+                            name: tune ? tune.name : ""
+                            // Never empty: a hidden subtitle drops a child out of the row layout and
+                            // TuneListItem's height then oscillates (binding loop).
+                            subtitle: {
+                                if (!tune) {
+                                    return "";
+                                }
+                                var parts = [];
+                                if (tune.date) {
+                                    parts.push(Qt.formatDateTime(new Date(tune.date)));
+                                }
+                                if (tune.source && tune.source.type === "refloat-archive") {
+                                    parts.push("Refloat Archive");
+                                }
+                                if (parts.length === 0) {
+                                    parts.push("Local");
+                                }
+                                return parts.join(" · ");
+                            }
+                            favorite: tune ? !!tune.favorite : false
+                            editable: true
+
+                            onClicked: {
+                                applyConfigDialog.show(tune, false, true);
+                            }
+
+                            onHeld: {
+                                editTuneDialog.show(tune.uuid);
+                            }
+
+                            onFavoriteToggled: {
+                                tuneManager.setFavorite(tune.uuid, !tune.favorite);
+                            }
+                        }
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        Layout.margins: 20
+                        visible: tuneManager.myTunes.length === 0
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                        wrapMode: Text.WordWrap
+                        text: "No tunes saved yet. Use \"Pull and Save from board\" or favorite tunes from the archives."
+                    }
+                }
+            }
+        }
+    }
+
+    BaseDialog {
         id: tuneArchiveDialog
         implicitHeight: fullHeight
         clip: true
