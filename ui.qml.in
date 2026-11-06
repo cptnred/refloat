@@ -6647,6 +6647,113 @@ Item {
     }
 
     BaseDialog {
+        id: importTuneDialog
+        placeAtTop: true
+
+        title: "Paste Tune Code"
+        standardButtons: Dialog.Save | Dialog.Close
+
+        property var decoded: null
+
+        function show() {
+            decoded = null;
+            importCodeText.text = "";
+            importStatus.text = "";
+            importTuneDiff.setModel([]);
+            importTuneDiff.reset();
+            standardButton(Dialog.Save).text = "Add";
+            standardButton(Dialog.Save).enabled = false;
+            open();
+        }
+
+        function parse() {
+            var text = importCodeText.text;
+            var result = text.length >= 10 ? tuneCodec.parseShareCode(text) : null;
+            decoded = result && !result.error ? result : null;
+
+            if (!result) {
+                importStatus.text = "";
+            } else if (result.error) {
+                importStatus.text = result.error;
+            } else {
+                var taken = tuneManager.myTunes.some((tune) => tune && tune.name === result.name);
+                importStatus.text = taken
+                    ? "\"%1\" - a tune of that name is already saved.".arg(result.name)
+                    : "\"%1\" - %2 values.".arg(result.name).arg(Object.keys(result.settings).length);
+            }
+
+            importTuneDiff.setModel(decoded
+                ? packageConfig.diffConfig({"settings": decoded.settings}).differs
+                : []);
+            importTuneDiff.reset();
+            standardButton(Dialog.Save).enabled = decoded !== null;
+        }
+
+        onAccepted: {
+            if (!decoded) {
+                return;
+            }
+            var tune = tuneManager.createTune(decoded.name, "", decoded.settings);
+            tune.source = {"type": "qrshare"};
+            tune.favorite = true;
+            tuneManager.addMyTune(tune);
+            VescIf.emitStatusMessage(decoded.name + " added", true);
+        }
+
+        ColumnLayout {
+            width: importTuneDialog.availableWidth
+            spacing: 10
+
+            LText {
+                Layout.fillWidth: true
+
+                font.pointSize: 11
+                wrapMode: Text.WordWrap
+                text: "Scan the other phone's code with its camera app and paste the text in here."
+            }
+
+            TextArea {
+                id: importCodeText
+                Layout.fillWidth: true
+                implicitHeight: 90
+
+                selectByMouse: true
+                wrapMode: TextEdit.WrapAnywhere
+                font.family: "monospace"
+                font.pointSize: 9
+
+                onTextChanged: importTuneDialog.parse()
+            }
+
+            Button {
+                Layout.alignment: Qt.AlignRight
+
+                text: "Paste"
+                onClicked: {
+                    importCodeText.selectAll();
+                    importCodeText.paste();
+                }
+            }
+
+            LText {
+                id: importStatus
+                Layout.fillWidth: true
+
+                visible: !!text
+                font.pointSize: 11
+                wrapMode: Text.WordWrap
+            }
+
+            ConfigDiff {
+                id: importTuneDiff
+                Layout.fillWidth: true
+                dialog: importTuneDialog
+                isTune: true
+            }
+        }
+    }
+
+    BaseDialog {
         id: tuneLibraryDialog
         implicitHeight: fullHeight
         clip: true
@@ -6973,6 +7080,24 @@ Item {
                 ColumnLayout {
                     id: myTunesPage
                     spacing: 15
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Layout.topMargin: 15
+
+                        LText {
+                            Layout.fillWidth: true
+
+                            font.pointSize: 11
+                            wrapMode: Text.WordWrap
+                            text: "Share a tune with the code button next to it."
+                        }
+
+                        Button {
+                            text: "Paste Code"
+                            onClicked: importTuneDialog.show()
+                        }
+                    }
 
                     ListView {
                         id: myTunesList
