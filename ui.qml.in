@@ -558,6 +558,7 @@ Item {
                                 if (value !== otherValue) {
                                     differs.push({
                                         "name": paramName,
+                                        "group": subGroup,
                                         "value": value,
                                         "otherValue": otherValue
                                     });
@@ -5743,7 +5744,8 @@ Item {
         property BaseDialog dialog
         property bool isTune: false
 
-        property bool isEmpty: diffModel.count === 0
+        property bool isEmpty: diffCount === 0
+        property int diffCount: 0
 
         property real rowHeight: 30
         property real valueColumnWidth: 60
@@ -5795,14 +5797,32 @@ Item {
         function setModel(m) {
             var model = diffModel;
             model.clear();
-            var empty = true;
+            var count = 0;
+            var lastGroup = null;
+            var groupRow = 0;
             for (var item of m) {
+                if (item.group !== lastGroup) {
+                    model.append({
+                        "isHeader": true,
+                        "name": item.group,
+                        "value": "",
+                        "otherValue": "",
+                        "alt": false
+                    });
+                    lastGroup = item.group;
+                    groupRow = 0;
+                }
+                item.isHeader = false;
+                // alternate row colors per group, headers break the index parity
+                item.alt = groupRow % 2 === 1;
                 item.value = displayValue(item, item.value);
                 item.otherValue = displayValue(item, item.otherValue);
                 model.append(item);
-                empty = false;
+                count++;
+                groupRow++;
             }
-            if (empty) {
+            diffCount = count;
+            if (count === 0) {
                 diffCheckbox.checked = false;
             }
         }
@@ -5828,7 +5848,7 @@ Item {
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.leftMargin: 22
-                    text: "Differences (%1)".arg(diffModel.count)
+                    text: "Differences (%1)".arg(configDiff.diffCount)
                     color: Utility.getAppHexColor("lightText")
                     verticalAlignment: Text.AlignVCenter
                 }
@@ -5905,13 +5925,26 @@ Item {
                 }
 
                 delegate: Rectangle {
-                    color: index % 2 === 0 ? Utility.getAppHexColor("lightBackground") : Utility.getAppHexColor("normalBackground")
+                    color: isHeader
+                        ? Utility.getAppHexColor("lightestBackground")
+                        : alt ? Utility.getAppHexColor("normalBackground") : Utility.getAppHexColor("lightBackground")
                     implicitWidth: diffView.width
                     implicitHeight: rowHeight
+
+                    NText {
+                        anchors.left: parent.left
+                        anchors.leftMargin: 5
+                        height: rowHeight
+                        visible: isHeader
+                        verticalAlignment: Text.AlignVCenter
+                        text: isHeader ? name : ""
+                        color: Utility.getAppHexColor("lightAccent")
+                    }
 
                     Row {
                         id: diffRow
                         anchors.centerIn: parent
+                        visible: !isHeader
 
                         NText {
                             width: diffView.width - 2 * valueColumnWidth - 10
@@ -5921,7 +5954,7 @@ Item {
                             wrapMode: Text.WordWrap
                             fontSizeMode: Text.Fit
                             minimumPointSize: 4
-                            text: packageConfig.getDisplayName(name)
+                            text: isHeader ? "" : packageConfig.getDisplayName(name)
                             color: Utility.getAppHexColor("lightText")
                         }
 
