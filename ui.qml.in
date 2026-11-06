@@ -1371,7 +1371,58 @@ Item {
             property var tuneArchive
             property var tuneArchiveDownloadDate
 
+            property var myTunes
+            // Kept for downgrades: the current tune now lives under currentTuneKey().
+            property var currentTune
+            property var tuneSlotsMigrated
+
             property var fullBackup
+        }
+
+        // Filled in Component.onCompleted, not by a binding: loadMyTunes() writes
+        // tuneStorage.myTunes while reading it, which Qt kills as a binding loop.
+        property var myTunes: []
+        // What the tunes page may show: favorites, minus those favorited for other boards only.
+        readonly property var favoriteTunes: (myTunes || []).filter((tune) => tune && tune.favorite
+            && showsOnThisBoard(tune))
+        // Split into the connected board's favorites and the board-agnostic ones.
+        readonly property var boardTunes: (favoriteTunes || []).filter((tune) => isBoardTune(tune))
+        readonly property var otherTunes: (favoriteTunes || []).filter((tune) => !isBoardTune(tune))
+        // Component.onCompleted like myTunes: resolving the reference needs myTunes.
+        property var currentTune: null
+
+        // Identity of the board in front of us. board.getId() is the last BLE
+        // address and survives a disconnect, so it is only the fallback.
+        function boardKey() {
+            return VescIf.getConnectedUuid() || board.getId();
+        }
+
+        // tune.boards holds the keys a tune is favorited for - not tune.board,
+        // which is only the stamp of where it was saved.
+        function isBoardTune(tune) {
+            if (!tune) {
+                return false;
+            }
+            // An empty key is not an identity: it would match every other
+            // board without one.
+            var key = boardKey();
+            if (!key) {
+                return false;
+            }
+            if (tune.boards) {
+                return tune.boards.indexOf(key) >= 0;
+            }
+            // beta leftover from when a tune belonged to a single board
+            return !!(tune.board && tune.board.pinned
+                && (tune.board.uuid ? tune.board.uuid === key
+                                    : tune.board.id === board.getId()));
+        }
+
+        // A tune favorited for no board at all belongs on every board's page.
+        function showsOnThisBoard(tune) {
+            var forSomeBoard = tune.boards ? tune.boards.length > 0
+                                           : !!(tune.board && tune.board.pinned);
+            return !forSomeBoard || isBoardTune(tune);
         }
 
         property var tunes: {
@@ -1422,6 +1473,41 @@ Item {
             tunes = tunes;
         }
 
+        // Check if a tune matches the current board config exactly
+        function tuneMatches(tune) {
+            if (!tune || !packageConfig.checkConfig()) {
+                return false;
+            }
+            var diff = packageConfig.diffConfig(tune);
+            return diff.differs.length === 0;
+        }
+
+        // Overwrite an existing local tune with the current board config
+        function overwriteTuneConfig(tuneUuid) {
+            var tune = findMyTune(tuneUuid);
+            if (!tune || !tune.uuid) {
+                return false;  // tune not found
+            }
+            if (tune.source && tune.source.type === "refloat-archive") {
+                return false;  // can't overwrite archive tunes
+            }
+
+            // returns the settings dict itself, not a wrapper
+            var settings = packageConfig.fetchConfig(true);
+            if (!settings) {
+                return false;
+            }
+
+            if (!updateTune(tune, tune.name, tune.description, settings)) {
+                return false;
+            }
+
+            saveMyTune(tuneUuid, tune);
+            setCurrentTune(tune);
+
+            return true;
+        }
+
         property alias fullBackup: tuneStorage.fullBackup
 
         function convertToOldFormat(tune) {
@@ -1469,6 +1555,8 @@ Item {
                 },
                 "board": {
                     "id": board.getId(),
+                    // the ESC's own id, unlike board.getId() (the last BLE address)
+                    "uuid": VescIf.getConnectedUuid(),
                 },
                 "settings": settings
             };
@@ -1653,6 +1741,161 @@ Item {
 
         function slotEmpty(slot) {
             return !tuneStorage.value(tuneId(slot), null);
+        }
+
+        function generateUuid() {
+            return Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8);
+        }
+
+        function slotsMigrated() {
+            var value = tuneStorage.tuneSlotsMigrated;
+            return value === true || value === "true";
+        }
+
+        // One-time migration of the legacy tune_slot_N storage into myTunes.
+        // The slot keys stay so downgrading remains possible.
+        function migrateTuneSlots() {
+            // A filled myTunes means the flag was lost - rerunning would overwrite newer tunes.
+            var existing = tuneStorage.myTunes;
+            if (existing) {
+                if (typeof existing === "string") {
+                    existing = JSON.parse(existing);
+                }
+                if (existing.length > 0) {
+                    tuneStorage.tuneSlotsMigrated = true;
+                    return;
+                }
+            }
+
+            var migrated = [];
+            for (var slot = 1; slot <= maxTunes; slot++) {
+                var tune = loadTune(slot);
+                if (tune) {
+                    tune.uuid = generateUuid();
+                    tune.favorite = true;
+                    tune.source = {"type": "local"};
+                    migrated.push(tune);
+                }
+            }
+            tuneStorage.myTunes = JSON.stringify(migrated);
+            tuneStorage.tuneSlotsMigrated = true;
+        }
+
+        function loadMyTunes() {
+            if (!slotsMigrated()) {
+                migrateTuneSlots();
+            }
+
+            var tunes = tuneStorage.myTunes;
+            if (!tunes) {
+                return [];
+            }
+            if (typeof tunes === "string") {
+                tunes = JSON.parse(tunes);
+            }
+            return tunes.map((tune) => tune.package ? migrateTune(tune) : tune);
+        }
+
+        function saveMyTunes(tunes) {
+            tuneStorage.myTunes = JSON.stringify(tunes);
+            // workaround needed so that the change is written through to the storage
+            myTunes = tunes;
+        }
+
+        function addMyTune(tune) {
+            if (!tune.uuid) {
+                tune.uuid = generateUuid();
+            }
+            var tunes = myTunes;
+            tunes.push(tune);
+            saveMyTunes(tunes);
+            return tune.uuid;
+        }
+
+        function findMyTuneIndex(uuid) {
+            for (var i = 0; i < myTunes.length; i++) {
+                if (myTunes[i].uuid === uuid) {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        function findMyTune(uuid) {
+            var index = findMyTuneIndex(uuid);
+            return index >= 0 ? myTunes[index] : null;
+        }
+
+        function findMyTuneBySource(source) {
+            for (var i = 0; i < myTunes.length; i++) {
+                var tuneSource = myTunes[i].source;
+                if (!tuneSource || tuneSource.type !== source.type) {
+                    continue;
+                }
+                if (myTunes[i].name === source.name) {
+                    return myTunes[i];
+                }
+            }
+            return null;
+        }
+
+        function saveMyTune(uuid, tune) {
+            var index = findMyTuneIndex(uuid);
+            if (index < 0) {
+                return;
+            }
+            var tunes = myTunes;
+            tunes[index] = tune;
+            saveMyTunes(tunes);
+            if (currentTune && currentTune.uuid === uuid) {
+                // the header holds the object, not a lookup
+                currentTune = tune;
+            }
+        }
+
+        function deleteMyTune(uuid) {
+            var index = findMyTuneIndex(uuid);
+            if (index < 0) {
+                return;
+            }
+            var tunes = myTunes;
+            tunes.splice(index, 1);
+            saveMyTunes(tunes);
+            // otherwise the header keeps the deleted tune and loadCurrentTune() restores it
+            if (currentTune && currentTune.uuid === uuid) {
+                tuneStorage.setValue(currentTuneKey(), "");
+                currentTune = null;
+            }
+        }
+
+        function setFavorite(uuid, favorite) {
+            var tune = findMyTune(uuid);
+            if (!tune) {
+                return;
+            }
+            tune.favorite = favorite;
+            saveMyTunes(myTunes);
+        }
+
+        // per board: myTunes is shared by every board, the tune on one of them is not
+        function currentTuneKey() {
+            return "currentTune_" + boardKey();
+        }
+
+        function setCurrentTune(tune) {
+            tuneStorage.setValue(currentTuneKey(), JSON.stringify(tune));
+            currentTune = tune;
+        }
+
+        function loadCurrentTune() {
+            // fallback for tunes applied straight from an archive; a saved entry wins
+            var stored = tuneStorage.value(currentTuneKey());
+            if (!stored) {
+                return null;
+            }
+            var tune = typeof stored === "string" ? JSON.parse(stored) : stored;
+            // a uuid means it lived in My Tunes - once deleted there, it is gone on every board
+            return tune.uuid ? findMyTune(tune.uuid) : tune;
         }
 
         function saveTuneArchive(tuneArchive) {
