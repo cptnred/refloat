@@ -513,10 +513,10 @@ Item {
         }
 
         function applyConfig(config) {
-            if (!checkConfig()) return;
+            if (!checkConfig()) return false;
 
             if (!versionCompatible(config)) {
-                return;
+                return false;
             }
 
             for (let [key, value] of Object.entries(config.settings)) {
@@ -536,6 +536,7 @@ Item {
             }
 
             writeConfig();
+            return true;
         }
 
         function diffConfig(other) {
@@ -922,7 +923,6 @@ Item {
         property alias showBattVoltagePerCell: prefShowBattVoltagePerCell.checked
         property alias battCurrentLog: prefBattCurrentLog.checked
         property int tempWarningOffset: 10
-        property alias tuneSlotCount: prefTuneSlotCount.value
         property alias showTuneDiffCount: prefShowTuneDiffCount.checked
         property int plotMaxWindowMinutes: 30
         property alias showWelcomeDialog: prefShowWelcomeDialog.checked
@@ -1425,18 +1425,6 @@ Item {
             return !forSomeBoard || isBoardTune(tune);
         }
 
-        property var tunes: {
-            var tunes = {}
-            for (var slot = 1; slot <= maxTunes; slot++) {
-                var tune = loadTune(slot);
-                if (tune) {
-                    tunes[slot] = tune;
-                }
-            }
-
-            return tunes;
-        }
-
         function replaceProperty(tune, oldName, newName) {
             if (tune.settings.hasOwnProperty(oldName)) {
                 tune.settings[newName] = tune.settings[oldName];
@@ -1470,7 +1458,8 @@ Item {
         function onUpdate() {
             triggerAutoRestore();
             // force recalculation of dependent variables
-            tunes = tunes;
+            myTunes = myTunes;
+            currentTune = currentTune;
         }
 
         // Check if a tune matches the current board config exactly
@@ -1712,15 +1701,6 @@ Item {
             }
         }
 
-        function saveTune(slot, tune) {
-            var id = tuneId(slot);
-            tuneStorage.setValue(id, JSON.stringify(convertToOldFormat(tune)));
-
-            tunes[slot] = tune;
-            // workaround needed so that the change is written through to the storage
-            tunes = tunes;
-        }
-
         function loadTune(slot) {
             var tune = tuneStorage.value(tuneId(slot));
             if (tune) {
@@ -1730,17 +1710,6 @@ Item {
                 return migrateTune(convertFromOldFormat(tune));
             }
             return null;
-        }
-
-        function eraseTune(slot) {
-            tuneStorage.setValue(tuneId(slot), "");
-            tunes[slot] = null;
-            // workaround needed so that the change is written through to the storage
-            tunes = tunes;
-        }
-
-        function slotEmpty(slot) {
-            return !tuneStorage.value(tuneId(slot), null);
         }
 
         function generateUuid() {
@@ -1967,6 +1936,8 @@ Item {
         }
 
         Component.onCompleted: {
+            myTunes = loadMyTunes();
+            currentTune = loadCurrentTune();
             var idBackup = loadBackup("backup_" + board.getId());
             if (idBackup) {
                 idBackupFinished(idBackup);
@@ -5413,30 +5384,6 @@ Item {
                             text: "Motor/Controller temperatures will be highlighted red if above TEMP - OFFSET, where TEMP is your Motor/MOSFET Temp Cutoff Start in Motor config. The package beeps when temperatures cross the TEMP - 3°C threshold and pushback triggers at TEMP - 2°C."
                         }
 
-                        RowLayout {
-                            Layout.fillWidth: true
-                            Layout.rightMargin: 20
-
-                            LText {
-                                text: "Number of tune slots"
-                            }
-
-                            Slider {
-                                id: prefTuneSlotCount
-                                Layout.fillWidth: true
-
-                                from: 2
-                                to: tuneManager.maxTunes
-                                value: 6
-                                stepSize: 1
-                            }
-
-                            LText {
-                                text: prefTuneSlotCount.value
-                                font.pointSize: 16
-                            }
-                        }
-
                         RightSwitch {
                             id: prefShowTuneDiffCount
                             checked: false
@@ -5538,12 +5485,24 @@ Item {
         title: tune ? "Edit Tune" : "Save Tune"
         standardButtons: !!tune ? Dialog.Save | Dialog.Discard | Dialog.Close : Dialog.Save | Dialog.Close
 
-        property var tuneSlot
+        property string tuneUuid
         property var tune: null
+        // read once per opening: neither call is a property, a binding never updates
+        property bool boardConnected: false
+        // An archive tune stays the archive's: values and name are never written
+        // back, only the local extras are editable here.
+        property bool fromArchive: false
 
-        function show(slot) {
-            tuneSlot = slot;
-            tune = tuneManager.loadTune(slot);
+        function show(uuid) {
+            tuneUuid = uuid || "";
+            // deep copy, so canceling the dialog doesn't mutate the stored tune
+            var stored = tuneUuid ? tuneManager.findMyTune(tuneUuid) : null;
+            tune = stored ? JSON.parse(JSON.stringify(stored)) : null;
+            saveTuneFavorite.checked = tune ? !!tune.favorite : true;
+            boardConnected = VescIf.isPortConnected();
+            saveTuneBoard.checked = boardConnected && tuneManager.isBoardTune(tune);
+            fromArchive = !!(tune && tune.source
+                && tune.source.type === "refloat-archive");
             editTuneDiff.setModel(packageConfig.diffConfig(tune).differs);
             editTuneDiff.reset();
 
@@ -5563,19 +5522,38 @@ Item {
             if (saveTuneNameInput.text) {
                 if (!tune) {
                     tune = tuneManager.createTune(saveTuneNameInput.text, saveTuneDescInput.text, packageConfig.fetchConfig(true));
+                    tune.source = {"type": "local"};
                 } else {
-                    var success = tuneManager.updateTune(tune, saveTuneNameInput.text, saveTuneDescInput.text, saveTuneOverwrite.checked ? packageConfig.fetchConfig(true) : null);
+                    // no settings: a changed tune is a new one via "Pull and Save from board"
+                    var success = tuneManager.updateTune(tune, saveTuneNameInput.text, saveTuneDescInput.text, null);
                     if (!success) {
                         return;
                     }
                 }
-                tuneManager.saveTune(tuneSlot, tune);
+                tune.favorite = saveTuneFavorite.checked;
+                // Adds or removes this board's key only. Without a key there is nothing
+                // to pin to - the empty string would match every unidentified board.
+                var key = tuneManager.boardKey();
+                if (key) {
+                    var boards = (tune.boards || []).filter((entry) => entry !== key);
+                    if (saveTuneBoard.checked) {
+                        boards.push(key);
+                    }
+                    tune.boards = boards;
+                }
+                if (tuneUuid) {
+                    tuneManager.saveMyTune(tuneUuid, tune);
+                } else {
+                    tuneManager.addMyTune(tune);
+                    // only pulling from the board marks it current, editing metadata does not
+                    tuneManager.setCurrentTune(tune);
+                }
                 VescIf.emitStatusMessage(saveTuneNameInput.text + " saved", true);
             }
         }
 
         onDiscarded: {
-            tuneManager.eraseTune(tuneSlot);
+            tuneManager.deleteMyTune(tuneUuid);
             VescIf.emitStatusMessage(tune.name + " erased", true);
             close();
         }
@@ -5601,6 +5579,7 @@ Item {
                     id: saveTuneNameInput
                     Layout.fillWidth: true
 
+                    enabled: !editTuneDialog.fromArchive
                     maximumLength: 30
                     text: editTuneDialog.tuneAttr("name")
 
@@ -5631,12 +5610,37 @@ Item {
                 isTune: true
             }
 
+            // archive tunes are read-only, matching ones have nothing to overwrite
+            Button {
+                Layout.fillWidth: true
+                visible: !!editTuneDialog.tune && !editTuneDialog.fromArchive && editTuneDiff.diffCount > 0
+                text: "Overwrite Tune with Current Config"
+
+                onClicked: {
+                    if (tuneManager.overwriteTuneConfig(editTuneDialog.tuneUuid)) {
+                        VescIf.emitStatusMessage(editTuneDialog.tuneAttr("name") + " updated", true);
+                    } else {
+                        VescIf.emitStatusMessage("Failed to update tune", false);
+                    }
+                    editTuneDialog.close();
+                }
+            }
+
             CheckBox {
-                id: saveTuneOverwrite
+                id: saveTuneFavorite
 
                 checked: true
-                visible: editTuneDialog.tune && !editTuneDiff.isEmpty
-                text: "Overwrite with current tune"
+                text: "Show on Tunes tab (favorite)"
+            }
+
+            CheckBox {
+                id: saveTuneBoard
+
+                enabled: editTuneDialog.boardConnected
+                // boardNameText keeps up with renames, board.getName() would not re-evaluate
+                text: editTuneDialog.boardConnected
+                    ? "Show only on %1".arg(boardNameText.name || "this board")
+                    : "Show only on this board (not connected)"
             }
         }
     }
@@ -6012,107 +6016,6 @@ Item {
                         verticalAlignment: Text.AlignVCenter
                         wrapMode: Text.WordWrap
                         text: "No tunes saved yet. Use \"Pull and Save from board\" or favorite tunes from the archives."
-                    }
-                }
-            }
-        }
-    }
-
-    BaseDialog {
-        id: tuneArchiveDialog
-        implicitHeight: fullHeight
-        clip: true
-
-        title: "Tune Archive"
-        standardButtons: Dialog.Reset | Dialog.Close
-
-        function download() {
-            tuneArchiveDownloadStatus.text = "Downloading tunes...";
-            var http = new XMLHttpRequest();
-            var url = "http://us-central1-mimetic-union-377520.cloudfunctions.net/float_package_tunes_via_http";
-            http.open("GET", url, true);
-            http.onreadystatechange = function() {
-                if (http.readyState === XMLHttpRequest.DONE) {
-                    if (http.status === 200) {
-                        tuneArchiveDownloadStatus.text = "Download succesful.";
-
-                        var tunes = tuneManager.parseCsv(http.responseText);
-                        tuneManager.saveTuneArchive(tunes);
-                        downloadedTunesModel.setTunes(tunes);
-                    } else if (http.status === 0) {
-                        tuneArchiveDownloadStatus.text = "Download failed: Connection error";
-                    } else {
-                        tuneArchiveDownloadStatus.text = "Download failed: %1 - %2".arg(http.status).arg(http.statusText);
-                    }
-                }
-
-            };
-
-            http.send();
-        }
-
-        function show() {
-            open();
-
-            var tuneArchive = tuneManager.loadTuneArchive();
-            // backwards compatibility: Check for the first item settings not being an array (if it is, redownload)
-            if (tuneArchive && tuneArchive.length > 0 && !Array.isArray(tuneArchive[0].settings)) {
-                downloadedTunesModel.setTunes(tuneArchive);
-                tuneArchiveDownloadStatus.text = "Tunes downloaded on %1".arg(tuneManager.getTuneArchiveDate());
-            } else {
-                download();
-            }
-        }
-
-        onReset: {
-            download();
-        }
-
-        Component.onCompleted: {
-            standardButton(Dialog.Reset).text = "Refresh"
-        }
-
-        ColumnLayout {
-            anchors.centerIn: parent
-            width: parent.width * 0.95
-            height: parent.height
-            spacing: 15
-            clip: true
-
-            LText {
-                id: tuneArchiveDownloadStatus
-                Layout.fillWidth: true
-                Layout.alignment: Qt.AlignHCenter
-
-                font.pointSize: 11
-                horizontalAlignment: Text.AlignHCenter
-                wrapMode: Text.WordWrap
-            }
-
-            ListView {
-                id: tuneArchiveTunesList
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                Layout.alignment: Qt.AlignHCenter
-                spacing: 10
-                clip: true
-
-                model: ListModel {
-                    id: downloadedTunesModel
-
-                    function setTunes(tunes) {
-                        clear();
-                        for (var i in tunes) {
-                            append({"tune": tunes[i]});
-                        }
-                    }
-                }
-
-                delegate: Button {
-                    width: tuneArchiveTunesList.width
-                    text: tune.name
-                    onClicked: {
-                        applyConfigDialog.show(tune, false, true);
                     }
                 }
             }
@@ -6667,9 +6570,11 @@ Item {
         }
 
         onApplied: {
-            packageConfig.applyConfig(config);
+            if (packageConfig.applyConfig(config) && isTune) {
+                tuneManager.setCurrentTune(config);
+            }
             close();
-            tuneArchiveDialog.close();
+            tuneLibraryDialog.close();
         }
 
         // "Keep Defaults" — uses RejectRole for middle position on Android
@@ -8182,138 +8087,268 @@ Item {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
 
-                GridLayout {
-                    property int spacing: 0.6 * unit
-                    anchors.fill: parent
-                    anchors.topMargin: spacing
-                    anchors.leftMargin: spacing
-                    anchors.rightMargin: spacing
-                    anchors.bottomMargin: spacing - bottomLine.height - root.spacing
-                    rowSpacing: spacing
-                    columnSpacing: spacing
-                    columns: (preferences.tuneSlotCount === 2 && height > width * 0.6) ? 1 : 2
+                RowLayout {
+                    id: currentTuneRow
+                    anchors.top: parent.top
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.topMargin: 0.3 * unit
+                    anchors.leftMargin: 0.6 * unit
+                    // leave room for the FAB
+                    anchors.rightMargin: 1.5 * unit
+                    spacing: 0.2 * unit
 
-                    Repeater {
-                        model: preferences.tuneSlotCount
+                    LText {
+                        text: "Tune:"
+                    }
 
-                        Button {
-                            id: button
-                            Layout.fillWidth: true
-                            Layout.fillHeight: true
-                            Layout.minimumHeight: buttonItemHeight + 2 * buttonItemMargin
-                            Layout.columnSpan: (slot === preferences.tuneSlotCount && (slot % 2) === 1) ? 2 : 1
+                    NText {
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                        text: tuneManager.currentTune ? tuneManager.currentTune.name : "None"
+                        color: tuneManager.currentTune ? Utility.getAppHexColor("lightText") : Utility.getAppHexColor("disabledText")
+                    }
 
-                            property int slot: index + 1
+                    DText {
+                        property int diff: tuneManager.currentTune ? packageConfig.diffConfig(tuneManager.currentTune).differs.length : 0
 
-                            property var tuneName: tuneManager.tunes[slot] ? tuneManager.tunes[slot].name : ""
-                            property var tuneDiff: tuneManager.tunes[slot] ? packageConfig.diffConfig(tuneManager.tunes[slot]).differs.length : -1
+                        font.pixelSize: fontSizeSmall
+                        visible: diff > 0
+                        text: preferences.showTuneDiffCount ? "modified (%1)".arg(diff) : "modified"
+                    }
+                }
 
-                            property real buttonItemHeight: unit
-                            property real buttonItemMargin: 0.15 * unit
+                ScrollView {
+                    id: tunesScroll
+                    anchors.top: currentTuneRow.bottom
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.bottom: parent.bottom
+                    anchors.topMargin: 0.3 * unit
+                    anchors.bottomMargin: -bottomLine.height - root.spacing
+                    clip: true
+                    contentWidth: availableWidth
+                    // Not bound to tunesGrid.implicitHeight: tunesGrid is this ScrollView's
+                    // content item, so binding back to it is a loop. Same value from the rows.
+                    contentHeight: tunesGrid.rowCount * tunesGrid.rowHeight
+                        + tunesGrid.separatorCount * (tunesGrid.separatorHeight + tunesGrid.gridSpacing)
+                        + (tunesGrid.rowCount + 1) * tunesGrid.gridSpacing
+                    visible: tuneManager.favoriteTunes.length > 0
 
-                            padding: 0
-                            leftInset: 0
-                            rightInset: 0
-                            topInset: 0
-                            bottomInset: 0
+                    GridLayout {
+                        id: tunesGrid
+                        // gridSpacing, not spacing: redeclaring spacing would shadow GridLayout's
+                        // own, which rowSpacing/columnSpacing are set from.
+                        property int gridSpacing: 0.6 * unit
+                        property real separatorHeight: 0.7 * unit
 
-                            onPressAndHold: {
-                                editTuneDialog.show(slot, tuneName);
-                            }
-
-                            onClicked: {
-                                if (tuneName) {
-                                    var tune = tuneManager.loadTune(slot);
-                                    packageConfig.applyConfig(tune);
+                        // Board favorites first under their own heading, then the rest - headings
+                        // and tunes share one Repeater. No board favorites, no heading.
+                        readonly property var entries: {
+                            var list = [];
+                            var boardGroup = tuneManager.boardTunes;
+                            var rest = tuneManager.otherTunes;
+                            var addGroup = function(tunes) {
+                                for (var i = 0; i < tunes.length; i++) {
+                                    list.push({"tune": tunes[i], "separator": "",
+                                               "wide": i === tunes.length - 1 && tunes.length % 2 === 1});
+                                }
+                            };
+                            if (boardGroup.length > 0) {
+                                list.push({"tune": null, "separator": "This Board", "wide": true});
+                                addGroup(boardGroup);
+                                if (rest.length > 0) {
+                                    list.push({"tune": null, "separator": "Other Favorites", "wide": true});
                                 }
                             }
+                            addGroup(rest);
+                            return list;
+                        }
+                        readonly property int separatorCount: entries.filter((entry) => !!entry.separator).length
 
-                            contentItem: Item {
-                                anchors.fill: parent
-                                anchors.margins: parent.buttonItemMargin
-                                clip: true
-                                z: 2
+                        // fill the page while the tunes fit, scroll beyond that
+                        property real rowCount: Math.max(1,
+                            Math.ceil(tuneManager.boardTunes.length / columns)
+                            + Math.ceil(tuneManager.otherTunes.length / columns))
+                        property real rowHeight: Math.max(1.4 * unit,
+                            (tunesScroll.availableHeight
+                             - separatorCount * (separatorHeight + gridSpacing)
+                             - (rowCount + 1) * gridSpacing) / rowCount)
 
-                                Item {
-                                    anchors.centerIn: parent
-                                    width: parent.width
-                                    height: button.buttonItemHeight
+                        width: tunesScroll.availableWidth - 2 * gridSpacing
+                        x: gridSpacing
+                        y: gridSpacing
+                        rowSpacing: gridSpacing
+                        columnSpacing: gridSpacing
+                        // two tunes in one column would put the separator between them
+                        columns: (separatorCount === 0 && tuneManager.favoriteTunes.length === 2
+                                  && tunesPage.height > tunesPage.width * 0.6) ? 1 : 2
 
-                                    Text {
-                                        id: tuneButtonText
-                                        width: parent.width
-                                        anchors.centerIn: tuneName ? parent : undefined
-                                        anchors.top: tuneName ? undefined : parent.top
+                        Repeater {
+                            // The count, not the array: Repeater.setModel() compares by value and
+                            // skips the rebuild, leaving stale diffs on the delegates.
+                            model: tunesGrid.entries.length
 
-                                        color: tuneName ? Utility.getAppHexColor("lightText") : Utility.getAppHexColor("disabledText")
-                                        font.pixelSize: 0.5 * unit
-                                        horizontalAlignment: Text.AlignHCenter
-                                        wrapMode: Text.WordWrap
-                                        text: tuneName || "empty slot"
-                                    }
+                            // the wrapper carries the layout attachments: tune button or separator
+                            Item {
+                                id: entryItem
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: separator
+                                    ? tunesGrid.separatorHeight : tunesGrid.rowHeight
+                                Layout.columnSpan: tunesGrid.columns === 2 && entry && entry.wide ? 2 : 1
 
-                                    DText {
-                                        id: tuneButtonHelpText
-                                        width: parent.width
-                                        anchors.bottom: parent.bottom
-
-                                        font.pixelSize: fontSizeSuperSmall
-                                        visible: !tuneName
-                                        horizontalAlignment: Text.AlignHCenter
-                                        text: "press and hold to set"
-                                    }
-                                }
+                                // delegates outlive their entry by one evaluation while the grid shrinks
+                                property var entry: tunesGrid.entries[index]
+                                property string separator: entry ? entry.separator : ""
 
                                 DText {
-                                    id: tuneButtonDiffCount
-                                    anchors.bottom: parent.bottom
+                                    anchors.left: parent.left
                                     anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
 
+                                    visible: !!entryItem.separator
                                     font.pixelSize: fontSizeSmall
-                                    visible: preferences.showTuneDiffCount && tuneDiff > 0
-                                    horizontalAlignment: Text.AlignHRight
-                                    text: tuneDiff
+                                    text: entryItem.separator
                                 }
-                            }
 
-                            background: Rectangle {
-                                id: buttonBg
-                                z: 1
+                                Button {
+                                    id: button
+                                    anchors.fill: parent
 
-                                border.color: tuneDiff === 0 ? Utility.getAppHexColor("lightAccent") : tuneName ? Utility.getAppHexColor("lightText") : Utility.getAppHexColor("disabledText")
-                                border.width: 2
-                                radius: 3
+                                    // contentItem/background hang off the wrapper, not off this Button
+                                    visible: !entryItem.separator
 
-                                color: Utility.getAppHexColor("normalBackground")
+                                    property var tune: entryItem.entry ? entryItem.entry.tune : null
 
-                                states: [
-                                    State {
-                                        name: "change"
-                                        when: button.pressed
-                                        PropertyChanges {target: buttonBg; color: Utility.getAppHexColor("lightestBackground");}
+                                    property var tuneName: tune ? tune.name : ""
+                                    property var tuneDiff: tune ? packageConfig.diffConfig(tune).differs.length : -1
+
+                                    property real buttonItemHeight: unit
+                                    property real buttonItemMargin: 0.15 * unit
+
+                                    padding: 0
+                                    leftInset: 0
+                                    rightInset: 0
+                                    topInset: 0
+                                    bottomInset: 0
+
+                                    onPressAndHold: {
+                                        if (tune) {
+                                            editTuneDialog.show(tune.uuid);
+                                        }
                                     }
-                                ]
 
-                                transitions: Transition {
-                                    ColorAnimation {property: "color"; duration: 200; easing.type: Easing.InOutCirc;}
+                                    onClicked: {
+                                        if (tune && packageConfig.applyConfig(tune)) {
+                                            tuneManager.setCurrentTune(tune);
+                                        }
+                                    }
+
+                                    contentItem: Item {
+                                        anchors.fill: parent
+                                        anchors.margins: parent.buttonItemMargin
+                                        clip: true
+                                        z: 2
+
+                                        Item {
+                                            anchors.centerIn: parent
+                                            width: parent.width
+                                            height: button.buttonItemHeight
+
+                                            Text {
+                                                id: tuneButtonText
+                                                width: parent.width
+                                                anchors.centerIn: parent
+
+                                                color: Utility.getAppHexColor("lightText")
+                                                font.pixelSize: 0.5 * unit
+                                                horizontalAlignment: Text.AlignHCenter
+                                                wrapMode: Text.WordWrap
+                                                text: button.tuneName
+                                            }
+                                        }
+
+                                        DText {
+                                            id: tuneButtonDiffCount
+                                            anchors.bottom: parent.bottom
+                                            anchors.right: parent.right
+
+                                            font.pixelSize: fontSizeSmall
+                                            visible: preferences.showTuneDiffCount && button.tuneDiff > 0
+                                            horizontalAlignment: Text.AlignHRight
+                                            text: button.tuneDiff
+                                        }
+                                    }
+
+                                    background: Rectangle {
+                                        id: buttonBg
+                                        z: 1
+
+                                        border.color: button.tuneDiff === 0 ? Utility.getAppHexColor("lightAccent") : Utility.getAppHexColor("lightText")
+                                        border.width: 2
+                                        radius: 3
+
+                                        color: Utility.getAppHexColor("normalBackground")
+
+                                        states: [
+                                            State {
+                                                name: "change"
+                                                when: button.pressed
+                                                PropertyChanges {target: buttonBg; color: Utility.getAppHexColor("lightestBackground");}
+                                            }
+                                        ]
+
+                                        transitions: Transition {
+                                            ColorAnimation {property: "color"; duration: 200; easing.type: Easing.InOutCirc;}
+                                        }
+                                    }
+
+                                    Glow {
+                                        anchors.fill: buttonBg
+                                        radius: Math.round(0.25 * unit)
+                                        samples: radius * 2 + 1
+                                        opacity: 0.3
+                                        color: Utility.getAppHexColor("lightAccent")
+                                        visible: button.tuneDiff === 0
+                                        source: buttonBg
+                                    }
                                 }
-                            }
-
-                            Glow {
-                                anchors.fill: buttonBg
-                                radius: Math.round(0.25 * unit)
-                                samples: radius * 2 + 1
-                                opacity: 0.3
-                                color: Utility.getAppHexColor("lightAccent")
-                                visible: tuneDiff === 0
-                                source: buttonBg
                             }
                         }
                     }
                 }
 
+                ColumnLayout {
+                    anchors.centerIn: parent
+                    width: parent.width * 0.8
+                    visible: tuneManager.favoriteTunes.length === 0
+                    spacing: 0.3 * unit
+
+                    NText {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        text: "No favorite tunes"
+                    }
+
+                    DText {
+                        Layout.fillWidth: true
+                        horizontalAlignment: Text.AlignHCenter
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: fontSizeSmall
+                        text: "Pull the tune from your board or star tunes in the Tune Library"
+                    }
+
+                    Button {
+                        Layout.alignment: Qt.AlignHCenter
+                        text: "Open Tune Library"
+                        onClicked: {
+                            tuneLibraryDialog.show(0);
+                        }
+                    }
+                }
+
                 FloatingToolButton {
-                    id: downloadTunesButton
+                    id: tunesMenuButton
                     anchors.right: parent.right
                     anchors.top: parent.top
                     size: unit
@@ -8323,7 +8358,27 @@ Item {
                     }
 
                     onClicked: {
-                        tuneArchiveDialog.show();
+                        tunesFabMenu.visible = true;
+                    }
+
+                    Menu {
+                        id: tunesFabMenu
+                        x: parent.width - width
+                        y: parent.height
+
+                        MenuItem {
+                            text: "Tune Library"
+                            onTriggered: {
+                                tuneLibraryDialog.show(0);
+                            }
+                        }
+
+                        MenuItem {
+                            text: "Pull and Save from board"
+                            onTriggered: {
+                                editTuneDialog.show(null);
+                            }
+                        }
                     }
                 }
             }
