@@ -482,6 +482,31 @@ Item {
             return !name.startsWith("haptic.") && !name.startsWith("hardware.") && !tuneBlacklist.includes(name);
         }
 
+        // Default share code drops what is per-board or per-battery; "share
+        // complete config" (tuneSchema full=true) skips this filter.
+        function paramIsShared(name) {
+            if (!paramIsTune(name)) {
+                return false;
+            }
+
+            var shareBlacklist = [
+                "fault_pitch",
+                "fault_roll",
+                "fault_delay_pitch",
+                "fault_delay_roll",
+                "fault_delay_switch_half",
+                "fault_delay_switch_full",
+                "fault_adc_half_erpm",
+                "fault_is_dual_switch",
+                "fault_moving_fault_disabled",
+                "enable_quickstop",
+                "fault_darkride_enabled",
+                "fault_reversestop_enabled",
+            ];
+
+            return !name.startsWith("leds.") && !name.startsWith("bms.") && !shareBlacklist.includes(name);
+        }
+
         function fetchConfig(tuneOnly) {
             if (!checkConfig()) return null;
 
@@ -500,6 +525,55 @@ Item {
             }
 
             return settings;
+        }
+
+        // Positional layout for the share codec: both sides must walk the
+        // parameters in the same order. Doubles are quantised onto the grid the
+        // editor can display, one decimal finer, to keep a code scannable.
+        function tuneSchema(full) {
+            if (!checkConfig()) return null;
+
+            var schema = [];
+            for (let subGroup of pkgConfig.getParamSubgroups("General")) {
+                for (let param of pkgConfig.getParamsFromSubgroup("General", subGroup)) {
+                    if (!full && !paramIsShared(param)) {
+                        continue;
+                    }
+
+                    var kind = getParamType(param);
+                    var q = 1;
+                    var lo = 0;
+                    var span = 1;
+                    if (kind === "Double") {
+                        q = (pkgConfig.getParamEditorScale(param) || 1)
+                            * Math.pow(10, pkgConfig.getParamDecimalsDouble(param) + 1);
+                        lo = Math.round(pkgConfig.getParamMinDouble(param) * q);
+                        span = Math.round(pkgConfig.getParamMaxDouble(param) * q) - lo;
+                    } else if (kind === "Int") {
+                        lo = pkgConfig.getParamMinInt(param);
+                        span = pkgConfig.getParamMaxInt(param) - lo;
+                    } else if (kind === "Enum") {
+                        span = Math.max(1, pkgConfig.getParamEnumNames(param).length - 1);
+                    } else if (kind !== "Bool") {
+                        // no tune holds a string or a bitfield today
+                        continue;
+                    }
+
+                    var bits = 1;
+                    while (Math.pow(2, bits) - 1 < span) {
+                        bits++;
+                    }
+                    if (bits > 32) {
+                        // truncating silently would be worse than not sharing
+                        return null;
+                    }
+
+                    schema.push({"name": param, "kind": kind, "q": q,
+                                 "lo": lo, "span": span, "bits": bits});
+                }
+            }
+
+            return schema;
         }
 
         function versionCompatible(config) {
@@ -1947,6 +2021,335 @@ Item {
                 autoBackupFinished(autoBackup);
             }
         }
+    }
+
+    // Share codes: a compact binary payload, base64 for pasting and the same
+    // text as a QR symbol. Plain Javascript, lifted out and tested with node.
+    QtObject {
+        id: tuneCodec
+
+        // Built once per flavour: walking every parameter per keystroke is too slow.
+        property var cachedSchema: null
+        property var cachedSchemaFull: null
+
+        // full picks the complete schema over the reduced default one
+        function sharedSchema(full) {
+            if (full) {
+                if (!cachedSchemaFull) {
+                    cachedSchemaFull = packageConfig.tuneSchema(true);
+                }
+                return cachedSchemaFull;
+            }
+            if (!cachedSchema) {
+                cachedSchema = packageConfig.tuneSchema(false);
+            }
+            return cachedSchema;
+        }
+
+        // Text for the QR symbol and the copy field, or null without a board.
+        function shareCode(tune, full) {
+            var schema = sharedSchema(full);
+            if (!schema || !tune) {
+                return null;
+            }
+            // A tune only holds paramIsTune values, so a complete config is the
+            // board's own one with the tune laid over it.
+            var settings = full
+                ? Object.assign(packageConfig.fetchConfig(false) || {}, tune.settings || {})
+                : tune.settings || {};
+            return toBase64(encodeShare(schema, tune.name, settings));
+        }
+
+        // {name, settings} or {error}. A code does not say which schema built
+        // it, so the embedded signature picks one.
+        function parseShareCode(text) {
+            var schema = sharedSchema(false);
+            var schemaFull = sharedSchema(true);
+            if (!schema && !schemaFull) {
+                return {"error": "Connect to a board first, a code can only be read against its parameters."};
+            }
+
+            var bytes = fromBase64((text || "").trim());
+            var sig = payloadSignature(bytes);
+            var chosen = (schema && schemaSignature(schema) === sig) ? schema
+                : (schemaFull && schemaSignature(schemaFull) === sig) ? schemaFull
+                : (schema || schemaFull);
+            return decodeShare(chosen, bytes);
+        }
+
+        // --- pure JS base64, no QML references -----------------------------
+        // Own encoder: Qt.btoa() converts to UTF-8 first and String.fromCharCode
+        // .apply() hands back NULs for typed arrays in QML's V4 engine.
+        readonly property string base64Chars: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+        function toBase64(bytes) {
+            var chars = base64Chars;
+            var n = bytes.length;
+            // join instead of +=: repeated concatenation gets slow
+            var parts = [];
+            var chunk = "";
+            for (var i = 0; i < n; i += 3) {
+                var b0 = bytes[i];
+                var b1 = i + 1 < n ? bytes[i + 1] : 0;
+                var b2 = i + 2 < n ? bytes[i + 2] : 0;
+                chunk += chars.charAt(b0 >> 2)
+                    + chars.charAt(((b0 & 3) << 4) | (b1 >> 4))
+                    + (i + 1 < n ? chars.charAt(((b1 & 15) << 2) | (b2 >> 6)) : "=")
+                    + (i + 2 < n ? chars.charAt(b2 & 63) : "=");
+                if (chunk.length >= 8192) {
+                    parts.push(chunk);
+                    chunk = "";
+                }
+            }
+            parts.push(chunk);
+            return parts.join("");
+        }
+
+        function fromBase64(text) {
+            var chars = base64Chars;
+            var bytes = [];
+            var buffer = 0;
+            var bits = 0;
+            for (var i = 0; i < text.length; i++) {
+                var c = chars.indexOf(text.charAt(i));
+                if (c < 0) {
+                    // padding, whitespace and line breaks a pasted code picked up
+                    continue;
+                }
+                buffer = (buffer << 6) | c;
+                bits += 6;
+                if (bits >= 8) {
+                    bits -= 8;
+                    bytes.push((buffer >> bits) & 0xff);
+                }
+            }
+            return bytes;
+        }
+
+        // --- end of pure JS base64 -----------------------------------------
+
+        // --- pure JS share code payload, no QML references ------------------
+        // Layout, all big endian:
+        //   'R' | format version | schema signature (4) | name length |
+        //   name (UTF-8) | presence bitmask (one bit per schema entry) |
+        //   bit packed values of the present entries | CRC-16 (2)
+
+        readonly property int shareMagic: 0x52
+        readonly property int shareFormat: 1
+        readonly property int shareNameMax: 30
+
+        function utf8Encode(text) {
+            var bytes = [];
+            for (var i = 0; i < text.length; i++) {
+                var c = text.charCodeAt(i);
+                if (c < 0x80) {
+                    bytes.push(c);
+                } else if (c < 0x800) {
+                    bytes.push(0xc0 | (c >> 6), 0x80 | (c & 0x3f));
+                } else {
+                    bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 0x3f), 0x80 | (c & 0x3f));
+                }
+            }
+            return bytes;
+        }
+
+        function utf8Decode(bytes, from, len) {
+            var text = "";
+            var i = from;
+            var end = from + len;
+            while (i < end) {
+                var c = bytes[i++];
+                if (c >= 0xf0) {
+                    // beyond the basic plane; the name field never carries this
+                    i += 3;
+                    continue;
+                } else if (c >= 0xe0) {
+                    c = ((c & 0x0f) << 12) | ((bytes[i] & 0x3f) << 6) | (bytes[i + 1] & 0x3f);
+                    i += 2;
+                } else if (c >= 0xc0) {
+                    c = ((c & 0x1f) << 6) | (bytes[i] & 0x3f);
+                    i += 1;
+                }
+                text += String.fromCharCode(c);
+            }
+            return text;
+        }
+
+        function crc32(text) {
+            var crc = -1;
+            for (var i = 0; i < text.length; i++) {
+                crc ^= text.charCodeAt(i) & 0xff;
+                for (var b = 0; b < 8; b++) {
+                    crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+                }
+            }
+            return (crc ^ -1) >>> 0;
+        }
+
+        // CRC-16/CCITT-FALSE; the pasted text variant has no other check.
+        function crc16(bytes, len) {
+            var crc = 0xffff;
+            for (var i = 0; i < len; i++) {
+                crc ^= bytes[i] << 8;
+                for (var b = 0; b < 8; b++) {
+                    crc = (crc & 0x8000) ? ((crc << 1) ^ 0x1021) & 0xffff : (crc << 1) & 0xffff;
+                }
+            }
+            return crc;
+        }
+
+        function writeBits(out, value, bits) {
+            for (var b = bits - 1; b >= 0; b--) {
+                if ((out.bit & 7) === 0) {
+                    out.bytes.push(0);
+                }
+                if (Math.floor(value / Math.pow(2, b)) % 2) {
+                    out.bytes[out.bytes.length - 1] |= 0x80 >> (out.bit & 7);
+                }
+                out.bit++;
+            }
+        }
+
+        function readBits(inp, bits) {
+            var value = 0;
+            for (var b = 0; b < bits; b++) {
+                var cur = inp.bytes[inp.from + (inp.bit >> 3)];
+                value = value * 2 + ((cur >> (7 - (inp.bit & 7))) & 1);
+                inp.bit++;
+            }
+            return value;
+        }
+
+        // Fingerprint of everything the bit layout and the value mapping depend on.
+        function schemaSignature(schema) {
+            var parts = [];
+            for (var i = 0; i < schema.length; i++) {
+                var e = schema[i];
+                // q and span matter as much as the bit width: the same layout with a
+                // different quantisation would decode into plausible wrong numbers.
+                parts.push(e.name + "|" + e.kind + "|" + e.bits + "|" + e.lo
+                           + "|" + e.q + "|" + e.span);
+            }
+            return crc32(parts.join(","));
+        }
+
+        // Signature read without knowing which schema produced the payload.
+        function payloadSignature(bytes) {
+            if (!bytes || bytes.length < 6) {
+                return null;
+            }
+            return (bytes[2] * 16777216) + (bytes[3] << 16) + (bytes[4] << 8) + bytes[5];
+        }
+
+        function encodeShare(schema, name, settings) {
+            var i;
+            var bytes = [shareMagic, shareFormat];
+            var sig = schemaSignature(schema);
+            bytes.push((sig >>> 24) & 0xff, (sig >>> 16) & 0xff, (sig >>> 8) & 0xff, sig & 0xff);
+
+            var nameBytes = utf8Encode((name || "").slice(0, shareNameMax));
+            bytes.push(nameBytes.length);
+            for (i = 0; i < nameBytes.length; i++) {
+                bytes.push(nameBytes[i]);
+            }
+
+            var maskLen = Math.ceil(schema.length / 8);
+            var mask = [];
+            for (i = 0; i < maskLen; i++) {
+                mask.push(0);
+            }
+            var values = {"bytes": [], "bit": 0};
+            for (i = 0; i < schema.length; i++) {
+                var e = schema[i];
+                if (!settings.hasOwnProperty(e.name)) {
+                    continue;
+                }
+                mask[i >> 3] |= 0x80 >> (i & 7);
+                var raw = e.kind === "Bool"
+                    ? (settings[e.name] ? 1 : 0)
+                    : Math.round(settings[e.name] * e.q) - e.lo;
+                writeBits(values, Math.max(0, Math.min(e.span, raw)), e.bits);
+            }
+            for (i = 0; i < maskLen; i++) {
+                bytes.push(mask[i]);
+            }
+            for (i = 0; i < values.bytes.length; i++) {
+                bytes.push(values.bytes[i]);
+            }
+
+            var crc = crc16(bytes, bytes.length);
+            bytes.push((crc >> 8) & 0xff, crc & 0xff);
+            return bytes;
+        }
+
+        // Returns {name, settings} or {error} - never a partial result.
+        function decodeShare(schema, bytes) {
+            var i;
+            if (!bytes || bytes.length < 10) {
+                return {"error": "Code is too short."};
+            }
+            if (bytes[0] !== shareMagic) {
+                return {"error": "This is not a tune code."};
+            }
+            if (bytes[1] !== shareFormat) {
+                return {"error": "Code uses a newer format than this package understands."};
+            }
+            var crc = crc16(bytes, bytes.length - 2);
+            if (((crc >> 8) & 0xff) !== bytes[bytes.length - 2] || (crc & 0xff) !== bytes[bytes.length - 1]) {
+                return {"error": "Code is damaged or incomplete."};
+            }
+            var sig = schemaSignature(schema);
+            var codeSig = payloadSignature(bytes);
+            if (codeSig !== sig) {
+                return {"error": "Code comes from a different package version."};
+            }
+
+            var nameLen = bytes[6];
+            var pos = 7 + nameLen;
+            var maskLen = Math.ceil(schema.length / 8);
+            if (pos + maskLen + 2 > bytes.length) {
+                return {"error": "Code is damaged or incomplete."};
+            }
+            var name = utf8Decode(bytes, 7, nameLen);
+
+            var present = [];
+            var bitCount = 0;
+            for (i = 0; i < schema.length; i++) {
+                var set = ((bytes[pos + (i >> 3)] >> (7 - (i & 7))) & 1) !== 0;
+                present.push(set);
+                if (set) {
+                    bitCount += schema[i].bits;
+                }
+            }
+            pos += maskLen;
+            if (pos + Math.ceil(bitCount / 8) + 2 > bytes.length) {
+                return {"error": "Code is damaged or incomplete."};
+            }
+
+            var inp = {"bytes": bytes, "from": pos, "bit": 0};
+            var settings = {};
+            for (i = 0; i < schema.length; i++) {
+                if (!present[i]) {
+                    continue;
+                }
+                var e = schema[i];
+                var raw = readBits(inp, e.bits);
+                if (raw > e.span) {
+                    return {"error": "Code is damaged or incomplete."};
+                }
+                if (e.kind === "Bool") {
+                    settings[e.name] = raw !== 0;
+                } else if (e.kind === "Double") {
+                    settings[e.name] = (raw + e.lo) / e.q;
+                } else {
+                    settings[e.name] = raw + e.lo;
+                }
+            }
+            return {"name": name, "settings": settings};
+        }
+
+        // --- end of pure JS share code payload ------------------------------
+
     }
 
     property var state: QtObject {
