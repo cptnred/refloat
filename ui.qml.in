@@ -1496,6 +1496,8 @@ Item {
             if (settings) {
                 tune.settings = settings;
                 tune.date = new Date();
+                // fresh from the board, so migrateTune() must not run over them again
+                tune.package = {"name": packageName, "version": packageVersion};
             }
             tune.version = formatVersion;
 
@@ -1510,6 +1512,10 @@ Item {
             }
 
             var [pMajor, pMinor] = versionMajorMinor(packageVersion);
+            // a tune from a newer package must keep its version
+            if (!(major < pMajor || (major == pMajor && minor < pMinor))) {
+                return tune;
+            }
 
             while (major < pMajor || (major == pMajor && minor < pMinor)) {
                 var versionKey = [major, minor].join(".");
@@ -1519,6 +1525,8 @@ Item {
                     minor++;
                 }
             }
+            // otherwise every load migrates the already migrated settings again
+            tune.package.version = packageVersion;
             return tune;
         }
 
